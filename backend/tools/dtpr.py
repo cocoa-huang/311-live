@@ -1,8 +1,8 @@
-from backend.schemas import DataOrigin, DtprStep
+from backend.schemas import CivicContext, DataOrigin, DtprStep
 
 
-def build_demo_dtpr_chain() -> list[DtprStep]:
-    return [
+def build_demo_dtpr_chain(civic_context: CivicContext | None = None) -> list[DtprStep]:
+    steps = [
         DtprStep(
             id="voice-text",
             label="Resident description",
@@ -39,9 +39,13 @@ def build_demo_dtpr_chain() -> list[DtprStep]:
         DtprStep(
             id="routing",
             label="Routing suggestion",
-            data_type="generated service category and agency route",
+            data_type="generated service category, agency route, and civic context",
             purpose="Suggest the city service path most likely to resolve the issue.",
-            processor="backend routing fallback",
+            processor=(
+                "backend routing fallback with 311 historical-context provider"
+                if civic_context
+                else "backend routing fallback"
+            ),
             destination="draft report routing recommendation",
             retention="confirmed report payload only after resident confirmation",
             control_point="resident reviews the suggested category before confirmation",
@@ -59,3 +63,21 @@ def build_demo_dtpr_chain() -> list[DtprStep]:
             origin=DataOrigin.REVIEW_REQUIRED,
         ),
     ]
+
+    if civic_context is not None:
+        steps.insert(
+            3,
+            DtprStep(
+                id="civic-open-data-context",
+                label="Civic open-data context",
+                data_type="historical 311 service-request summary",
+                purpose="Ground report wording, routing, and uncertainty in similar civic records.",
+                processor=civic_context.source,
+                destination="draft report context and future model prompt packet",
+                retention="summary retained with the draft; raw historical rows are not stored",
+                control_point="resident reviews and edits the draft before confirmation",
+                origin=DataOrigin.INFERRED,
+            ),
+        )
+
+    return steps

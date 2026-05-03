@@ -104,6 +104,31 @@ npm run dev -- -H 127.0.0.1 -p 3000
 
 Open `http://127.0.0.1:3000` while the backend is running on port `8000`.
 
+## Phone Testing
+
+Mobile camera and location require a secure browser context. Plain `http://<your-laptop-ip>:3000` is useful for layout checks, but phone camera/location permissions usually require HTTPS.
+
+Recommended local phone test:
+
+1. Start the backend:
+
+```bash
+.venv/bin/python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+```
+
+2. Start the frontend without `NEXT_PUBLIC_API_BASE_URL` so it uses the same-origin backend proxy:
+
+```bash
+cd frontend
+BACKEND_INTERNAL_URL=http://127.0.0.1:8000 npm run dev -- -H 127.0.0.1 -p 3000
+```
+
+3. Expose the frontend through an HTTPS tunnel, such as ngrok or Cloudflare Tunnel, pointing at `http://127.0.0.1:3000`.
+
+4. Open the HTTPS tunnel URL on your phone. The frontend will call its own `/api/backend/...` proxy, and the Next.js dev server will forward those calls to the local FastAPI backend.
+
+If you set `NEXT_PUBLIC_API_BASE_URL`, make sure it is an HTTPS URL reachable by the phone. Do not set it to `http://127.0.0.1:8000` for phone testing, because that points to the phone itself.
+
 Frontend verification:
 
 ```bash

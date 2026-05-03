@@ -45,6 +45,20 @@ class RoutingTarget(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class CivicContext(BaseModel):
+    source: str
+    dataset: str
+    query_summary: str
+    matched_count: int = Field(default=0, ge=0)
+    likely_agencies: List[str] = Field(default_factory=list)
+    likely_problem_types: List[str] = Field(default_factory=list)
+    likely_problem_details: List[str] = Field(default_factory=list)
+    evidence_summary: str
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    used_live_data: bool = False
+    fallback_reason: Optional[str] = None
+
+
 class EvidenceItem(BaseModel):
     kind: Literal["text", "audio", "image", "location"]
     summary: str
@@ -91,6 +105,14 @@ class HumanReviewField(BaseModel):
 
 class ReportDraftRequest(BaseModel):
     scenario: Optional[Literal["flooding_near_school_crossing"]] = None
+    demo_variant: Optional[
+        Literal[
+            "baseline",
+            "confirmed_location",
+            "blocked_crosswalk",
+            "visible_drain_obstruction",
+        ]
+    ] = None
     transcript: Optional[str] = None
     image_summary: Optional[str] = None
     location: Optional[Location] = None
@@ -100,6 +122,15 @@ class ReportConfirmRequest(BaseModel):
     report_id: str
     accepted: bool = True
     correction: Optional[str] = None
+
+
+class ReportUpdateRequest(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1)
+    description: Optional[str] = Field(default=None, min_length=1)
+    category: Optional[str] = Field(default=None, min_length=1)
+    subcategory: Optional[str] = None
+    priority: Optional[Priority] = None
+    location: Optional[Location] = None
 
 
 class ReportDraft(BaseModel):
@@ -114,6 +145,7 @@ class ReportDraft(BaseModel):
     observed_at: Optional[datetime] = None
     priority: Priority = Priority.UNKNOWN
     routing: Optional[RoutingTarget] = None
+    civic_context: Optional[CivicContext] = None
     collected_inputs: List[CollectedInput] = Field(default_factory=list)
     inferred_context: List[InferredContext] = Field(default_factory=list)
     human_review: List[HumanReviewField] = Field(default_factory=list)
@@ -126,3 +158,19 @@ class ReportDraft(BaseModel):
 class ReportConfirmResponse(BaseModel):
     report: ReportDraft
     message: str
+
+
+class ModelContextPacket(BaseModel):
+    report_id: str
+    task: Literal["draft_311_service_request"]
+    model_role: str
+    prompt_goal: str
+    observed_inputs: List[str] = Field(default_factory=list)
+    inferred_context: List[str] = Field(default_factory=list)
+    civic_evidence: Optional[CivicContext] = None
+    routing_context: Optional[RoutingTarget] = None
+    uncertainty: List[UncertaintyItem] = Field(default_factory=list)
+    required_human_confirmations: List[HumanReviewField] = Field(default_factory=list)
+    output_requirements: List[str] = Field(default_factory=list)
+    guardrails: List[str] = Field(default_factory=list)
+    dtpr_disclosures: List[str] = Field(default_factory=list)
