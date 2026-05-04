@@ -21,7 +21,9 @@ class CivicContextProvider(Protocol):
 
 class Fallback311ContextProvider:
     def context_for_report(self, request: ReportDraftRequest) -> CivicContext:
-        return fallback_311_context("live Open Data context disabled")
+        return fallback_311_context(
+            "live Open Data context disabled", request.scenario
+        )
 
 
 class Socrata311ContextProvider:
@@ -33,7 +35,7 @@ class Socrata311ContextProvider:
         if request.scenario == "flooding_near_school_crossing" and location is None:
             location = Location(latitude=40.7589, longitude=-73.9891)
 
-        params = self._build_params(location)
+        params = self._build_params(location, request.scenario)
         headers = {}
         if self._settings.socrata_app_token:
             headers["X-App-Token"] = self._settings.socrata_app_token
@@ -57,7 +59,7 @@ class Socrata311ContextProvider:
             rows=rows,
             source="NYC Open Data Socrata API",
             dataset=self._settings.socrata_service_requests_dataset,
-            query_summary="recent similar 311 requests for flooding, sewer, catch basin, crosswalk, and school-safety language",
+            query_summary=_query_summary_for_scenario(request.scenario),
             used_live_data=True,
         )
 
@@ -69,17 +71,11 @@ class Socrata311ContextProvider:
             f"{self._settings.socrata_service_requests_dataset}.json"
         )
 
-    def _build_params(self, location: Location | None) -> dict[str, str | int]:
+    def _build_params(
+        self, location: Location | None, scenario: str | None
+    ) -> dict[str, str | int]:
         since = datetime.now(timezone.utc) - timedelta(days=365)
-        terms = [
-            "complaint_type like '%Flood%'",
-            "complaint_type like '%Sewer%'",
-            "complaint_type like '%Catch Basin%'",
-            "descriptor like '%Flood%'",
-            "descriptor like '%Catch Basin%'",
-            "descriptor like '%Crosswalk%'",
-            "descriptor like '%School%'",
-        ]
+        terms = _terms_for_scenario(scenario)
         where_parts = [f"created_date >= '{since.date().isoformat()}T00:00:00'"]
 
         if location and location.latitude is not None and location.longitude is not None:
@@ -111,7 +107,34 @@ def provider_from_settings(settings: Settings) -> CivicContextProvider:
     return Fallback311ContextProvider()
 
 
-def fallback_311_context(reason: str) -> CivicContext:
+def fallback_311_context(reason: str, scenario: str | None = None) -> CivicContext:
+    if scenario == "trash_bags_on_street":
+        return CivicContext(
+            source="deterministic demo civic context",
+            dataset="NYC Open Data 311 Service Requests 2020-present reference",
+            query_summary="fallback context for street trash, missed collection, and sanitation obstruction reports",
+            matched_count=0,
+            likely_agencies=["NYC DSNY", "NYC311"],
+            likely_problem_types=[
+                "Dirty Condition",
+                "Missed Collection",
+                "Sanitation Condition",
+            ],
+            likely_problem_details=[
+                "Trash bags or loose refuse on the sidewalk or curb",
+                "Possible missed collection or set-out timing issue",
+            ],
+            evidence_summary=(
+                "Historical 311 patterns are represented by a deterministic fallback: "
+                "street trash and bagged refuse conditions commonly route toward DSNY, "
+                "while sidewalk blockage and exact location should remain explicit for "
+                "human review."
+            ),
+            confidence=0.56,
+            used_live_data=False,
+            fallback_reason=reason,
+        )
+
     return CivicContext(
         source="deterministic demo civic context",
         dataset="NYC Open Data 311 Service Requests 2020-present reference",
@@ -178,3 +201,39 @@ def _top_values(rows: list[dict[str, object]], field: str) -> list[str]:
         if row.get(field) not in (None, "")
     ]
     return [value for value, _count in Counter(values).most_common(3)]
+
+
+def _terms_for_scenario(scenario: str | None) -> list[str]:
+    if scenario == "trash_bags_on_street":
+        return [
+            "complaint_type like '%Dirty%'",
+            "complaint_type like '%Sanitation%'",
+            "complaint_type like '%Missed Collection%'",
+            "complaint_type like '%Derelict%'",
+            "descriptor like '%Trash%'",
+            "descriptor like '%Garbage%'",
+            "descriptor like '%Refuse%'",
+            "descriptor like '%Sidewalk%'",
+        ]
+
+    return [
+        "complaint_type like '%Flood%'",
+        "complaint_type like '%Sewer%'",
+        "complaint_type like '%Catch Basin%'",
+        "descriptor like '%Flood%'",
+        "descriptor like '%Catch Basin%'",
+        "descriptor like '%Crosswalk%'",
+        "descriptor like '%School%'",
+    ]
+
+
+def _query_summary_for_scenario(scenario: str | None) -> str:
+    if scenario == "trash_bags_on_street":
+        return (
+            "recent similar 311 requests for dirty conditions, sanitation, "
+            "missed collection, trash, garbage, refuse, and sidewalk language"
+        )
+    return (
+        "recent similar 311 requests for flooding, sewer, catch basin, "
+        "crosswalk, and school-safety language"
+    )

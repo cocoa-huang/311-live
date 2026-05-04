@@ -22,6 +22,17 @@ function percent(value: number) {
   return `${Math.round(value * 100)}%`;
 }
 
+function locationDetail(report: ReportDraft) {
+  const details = [
+    report.location.intersection,
+    report.location.street_address,
+    report.location.neighborhood,
+    report.location.borough,
+  ].filter(Boolean);
+
+  return Array.from(new Set(details)).join(" · ");
+}
+
 export function ReportReview({
   report,
   onConfirm,
@@ -35,6 +46,7 @@ export function ReportReview({
   const [locationLabel, setLocationLabel] = useState(report.location.label ?? "");
   const [locationConfirmed, setLocationConfirmed] = useState(report.location.confirmed);
   const [priority, setPriority] = useState(report.priority);
+  const detail = locationDetail(report);
 
   useEffect(() => {
     setTitle(report.title);
@@ -133,6 +145,28 @@ export function ReportReview({
                 />
                 Resident confirmed exact location
               </label>
+              {(detail || report.location.accuracy_meters || report.location.source) && (
+                <dl className="mt-3 grid grid-cols-1 gap-2 text-xs text-ink/62 sm:grid-cols-2">
+                  {detail && (
+                    <div>
+                      <dt className="font-semibold text-ink">Review context</dt>
+                      <dd>{detail}</dd>
+                    </div>
+                  )}
+                  {report.location.accuracy_meters && (
+                    <div>
+                      <dt className="font-semibold text-ink">GPS accuracy</dt>
+                      <dd>{Math.round(report.location.accuracy_meters)} m</dd>
+                    </div>
+                  )}
+                  {report.location.source && (
+                    <div>
+                      <dt className="font-semibold text-ink">Location source</dt>
+                      <dd>{report.location.source}</dd>
+                    </div>
+                  )}
+                </dl>
+              )}
             </div>
           </div>
           {report.routing && (

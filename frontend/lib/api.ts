@@ -3,12 +3,22 @@ export type DemoVariant =
   | "baseline"
   | "confirmed_location"
   | "blocked_crosswalk"
-  | "visible_drain_obstruction";
+  | "visible_drain_obstruction"
+  | "street_trash_bags";
+export type ReportScenario =
+  | "flooding_near_school_crossing"
+  | "trash_bags_on_street";
 
 export interface Location {
   label: string | null;
   latitude: number | null;
   longitude: number | null;
+  accuracy_meters: number | null;
+  street_address: string | null;
+  intersection: string | null;
+  neighborhood: string | null;
+  borough: string | null;
+  source: string | null;
   confirmed: boolean;
 }
 
@@ -114,11 +124,30 @@ export interface ConfirmResponse {
   message: string;
 }
 
+export interface LiveClassifyResponse {
+  scenario: ReportScenario;
+  demo_variant: DemoVariant;
+  candidate: string;
+  confirmation: string;
+  followup: string;
+  model_source: string;
+  fallback_reason: string | null;
+}
+
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
+const WS_BASE_URL =
+  process.env.NEXT_PUBLIC_WS_BASE_URL ?? "";
 
 function apiUrl(path: string) {
   return API_BASE_URL ? `${API_BASE_URL}${path}` : `/api/backend${path}`;
+}
+
+export function liveWebSocketUrl() {
+  if (WS_BASE_URL) {
+    return `${WS_BASE_URL}/ws/live`;
+  }
+  return null;
 }
 
 async function parseResponse<T>(response: Response): Promise<T> {
@@ -130,20 +159,43 @@ async function parseResponse<T>(response: Response): Promise<T> {
 }
 
 export async function createDemoDraft(
+  scenario: ReportScenario = "flooding_near_school_crossing",
   demoVariant: DemoVariant = "baseline",
   location?: Location,
+  transcript?: string,
 ): Promise<ReportDraft> {
   const response = await fetch(apiUrl("/api/report/draft"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      scenario: "flooding_near_school_crossing",
+      scenario,
       demo_variant: demoVariant,
       location,
+      transcript,
     }),
   });
 
   return parseResponse<ReportDraft>(response);
+}
+
+export async function classifyLiveObservation(
+  transcript: string,
+  imageSummary?: string,
+  imageFrame?: string,
+  location?: Location,
+): Promise<LiveClassifyResponse> {
+  const response = await fetch(apiUrl("/api/live/classify"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      transcript,
+      image_summary: imageSummary,
+      image_frame: imageFrame,
+      location,
+    }),
+  });
+
+  return parseResponse<LiveClassifyResponse>(response);
 }
 
 export async function confirmDraft(reportId: string): Promise<ConfirmResponse> {

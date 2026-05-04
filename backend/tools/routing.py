@@ -15,6 +15,15 @@ def fallback_route_for_category(
             confidence=0.74 if subcategory == "near_school_crossing" else 0.62,
         )
 
+    if category == "street_cleanliness":
+        return RoutingTarget(
+            department="Department of Sanitation",
+            agency="NYC DSNY",
+            service="Street cleanliness or missed collection review",
+            source="demo fallback route",
+            confidence=0.7 if subcategory == "trash_bags_on_street" else 0.58,
+        )
+
     return RoutingTarget(
         department="NYC311",
         agency="NYC311",

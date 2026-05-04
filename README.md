@@ -16,14 +16,15 @@ Build a phone-friendly 311 reporting flow that can:
 
 ## Current Scope
 
-The current milestone is a working thin vertical slice:
+The current milestone is a live-intake vertical slice:
 
 - FastAPI backend health endpoint.
-- Deterministic report draft and confirm workflow.
-- Next.js frontend that renders the demo report and DTPR data chain from backend JSON.
-- Placeholder camera, microphone, and location states.
+- Deterministic report draft, edit, model-context, and confirm workflow.
+- Backend `/ws/live` contract for live session start, observation, candidate detection, follow-up, location confirmation, and draft creation.
+- Next.js frontend that uses camera preview, browser geolocation, browser speech recognition where available, typed fallback, report review, and DTPR data chain rendering.
+- Deterministic fallback behavior when the live socket, speech recognition, or civic data lookup is unavailable.
 
-Gemini Live, real browser media capture, Socrata routing, editable report fields, and deployment are still upcoming.
+Gemini Live media streaming, final Vertex AI model selection, production reverse geocoding, real 311 submission, and deployment are still upcoming.
 
 Read [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md) first in future sessions. It records the product context, source-code boundary, DTPR requirements, and MVP assumptions.
 
@@ -31,7 +32,7 @@ Read [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md) first in future sessions
 
 - Backend: FastAPI, Pydantic, pytest
 - Frontend: Next.js, TypeScript, Tailwind CSS
-- Live agent: Gemini Live through Vertex AI with Application Default Credentials
+- Live agent: deterministic WebSocket bridge now; Gemini Live through Vertex AI with Application Default Credentials next
 - Deployment target: Cloud Run, likely split frontend and backend services
 - Civic routing: Socrata/Open Data lookup where available, with deterministic fallback routing for demo reliability
 
@@ -104,6 +105,25 @@ npm run dev -- -H 127.0.0.1 -p 3000
 
 Open `http://127.0.0.1:3000` while the backend is running on port `8000`.
 
+## Vertex Live Adapter
+
+The default live agent mode is deterministic so local demos work without Google Cloud credentials. To test the Vertex-backed Gemini Live adapter, create or select a Google Cloud project, enable Vertex AI, authenticate with Application Default Credentials, and set:
+
+```bash
+gcloud auth application-default login
+export LIVE_MODEL_MODE=vertex
+export GOOGLE_CLOUD_PROJECT=<your-project-id>
+export GOOGLE_CLOUD_LOCATION=us-central1
+export GEMINI_TEXT_LOCATION=global
+export GEMINI_TEXT_MODEL=gemini-2.5-flash
+export GEMINI_LIVE_LOCATION=us-central1
+export GEMINI_LIVE_MODEL=gemini-live-2.5-flash-preview-native-audio-09-2025
+```
+
+The current Vertex path uses `GEMINI_TEXT_MODEL` for candidate classification first and tracks `GEMINI_LIVE_MODEL` for the upcoming spoken live-agent path. It falls back to deterministic behavior if credentials, model access, the SDK call, or response parsing fails.
+The earlier CityNerve reference project used Gemini 2.0 Flash for multimodal intake classification. In `live-cloud-495302`, `gemini-2.5-flash` is the currently accessible text/multimodal classification model; the native-audio Live model is reserved for the later audio response path.
+During candidate detection, the frontend captures one compressed JPEG still frame from the active camera preview and sends it with the resident transcript to the backend classifier. This is the current multimodal bridge; continuous audio/video streaming is still upcoming.
+
 ## Phone Testing
 
 Mobile camera and location require a secure browser context. Plain `http://<your-laptop-ip>:3000` is useful for layout checks, but phone camera/location permissions usually require HTTPS.
@@ -122,6 +142,8 @@ Recommended local phone test:
 cd frontend
 BACKEND_INTERNAL_URL=http://127.0.0.1:8000 npm run dev -- -H 127.0.0.1 -p 3000
 ```
+
+Do not set `NEXT_PUBLIC_WS_BASE_URL` for the one-tunnel phone demo. The frontend will use the same-origin REST classify path through `/api/backend/...`, which lets Vertex-backed candidate detection work through the frontend tunnel. Set `NEXT_PUBLIC_WS_BASE_URL` only when the backend WebSocket is separately reachable from the phone over `wss://`.
 
 3. Expose the frontend through an HTTPS tunnel, such as ngrok or Cloudflare Tunnel, pointing at `http://127.0.0.1:3000`.
 

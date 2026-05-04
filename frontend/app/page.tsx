@@ -10,16 +10,18 @@ import {
   Mic,
   Play,
   RotateCcw,
-  SlidersHorizontal,
 } from "lucide-react";
 import { DtprChain } from "@/components/DtprChain";
 import { ReportReview } from "@/components/ReportReview";
 import { StatusPill } from "@/components/StatusPill";
 import {
+  classifyLiveObservation,
   confirmDraft,
   createDemoDraft,
+  liveWebSocketUrl,
   updateDraft,
   type DemoVariant,
+  type ReportScenario,
   type ReportDraft,
   type ReportUpdateRequest,
 } from "@/lib/api";
@@ -34,9 +36,66 @@ type Phase =
   | "confirmed";
 
 type CaptureStatus = "idle" | "requesting" | "active" | "denied" | "unavailable";
+type LiveAgentStatus = "offline" | "connecting" | "ready" | "thinking" | "fallback";
+
+interface SpeechRecognitionAlternativeLike {
+  transcript: string;
+}
+
+interface SpeechRecognitionResultLike {
+  isFinal: boolean;
+  0: SpeechRecognitionAlternativeLike;
+}
+
+interface SpeechRecognitionEventLike {
+  resultIndex: number;
+  results: {
+    length: number;
+    [index: number]: SpeechRecognitionResultLike;
+  };
+}
+
+interface SpeechRecognitionErrorEventLike {
+  error: string;
+}
+
+interface BrowserSpeechRecognition {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+}
+
+type SpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
+
+interface LiveAgentEvent {
+  type:
+    | "session_started"
+    | "candidate_detected"
+    | "followup_required"
+    | "location_confirmation_required"
+    | "draft_ready"
+    | "error";
+  session_id: string;
+  message: string;
+  payload: {
+    scenario?: ReportScenario;
+    demo_variant?: DemoVariant;
+    candidate?: string;
+    confirmation?: string;
+    followup?: string;
+    requires_location_confirmation?: boolean;
+    report?: ReportDraft;
+  };
+}
 
 const demoVariants: Array<{
   id: DemoVariant;
+  scenario: ReportScenario;
   label: string;
   state: string;
   candidate: string;
@@ -45,6 +104,7 @@ const demoVariants: Array<{
 }> = [
   {
     id: "baseline",
+    scenario: "flooding_near_school_crossing",
     label: "Baseline",
     state: "Needs exact location",
     candidate: "Flooding near a school crossing",
@@ -53,6 +113,7 @@ const demoVariants: Array<{
   },
   {
     id: "confirmed_location",
+    scenario: "flooding_near_school_crossing",
     label: "Confirmed",
     state: "Location ready",
     candidate: "Flooding at a confirmed school crossing",
@@ -61,6 +122,7 @@ const demoVariants: Array<{
   },
   {
     id: "blocked_crosswalk",
+    scenario: "flooding_near_school_crossing",
     label: "Blocked",
     state: "Higher safety signal",
     candidate: "Crosswalk access blocked by standing water",
@@ -69,33 +131,53 @@ const demoVariants: Array<{
   },
   {
     id: "visible_drain_obstruction",
+    scenario: "flooding_near_school_crossing",
     label: "Drain",
     state: "Catch basin visible",
     candidate: "Possible clogged catch basin causing flooding",
     confirmation: "I see flooding and possible debris near a drain. Is that what you want to report?",
     followup: "Is the drain covered by leaves, trash, or another obstruction?",
   },
+  {
+    id: "street_trash_bags",
+    scenario: "trash_bags_on_street",
+    label: "Trash",
+    state: "Works anywhere",
+    candidate: "Trash bags on the street or sidewalk",
+    confirmation: "I see bagged trash or loose refuse near your current location. Is that what you want to report?",
+    followup: "Are the bags blocking the sidewalk, curb, bike lane, or street?",
+  },
 ];
 
 export default function CitizenApp() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const liveSocketRef = useRef<WebSocket | null>(null);
   const livePanelRef = useRef<HTMLElement | null>(null);
   const [mounted, setMounted] = useState(false);
   const [phase, setPhase] = useState<Phase>("ready");
   const [draft, setDraft] = useState<ReportDraft | null>(null);
-  const [demoVariant, setDemoVariant] = useState<DemoVariant>("baseline");
+  const [issueDescription, setIssueDescription] = useState("");
+  const [detectedVariant, setDetectedVariant] = useState<
+    (typeof demoVariants)[number] | null
+  >(null);
   const [cameraStatus, setCameraStatus] = useState<CaptureStatus>("idle");
+  const [microphoneStatus, setMicrophoneStatus] = useState<CaptureStatus>("idle");
   const [locationStatus, setLocationStatus] = useState<CaptureStatus>("idle");
   const [currentLocation, setCurrentLocation] = useState<GeolocationCoordinates | null>(
     null,
   );
   const [loading, setLoading] = useState(false);
   const [captureLoading, setCaptureLoading] = useState(false);
+  const [interimTranscript, setInterimTranscript] = useState("");
+  const [liveAgentStatus, setLiveAgentStatus] = useState<LiveAgentStatus>("offline");
+  const [liveAgentMessage, setLiveAgentMessage] = useState<string | null>(null);
+  const [candidateFollowup, setCandidateFollowup] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const activeVariant = demoVariants.find((variant) => variant.id === demoVariant) ?? demoVariants[0];
+  const activeVariant = detectedVariant ?? inferIssueVariant(issueDescription);
 
   useEffect(() => {
     setMounted(true);
@@ -114,17 +196,40 @@ export default function CitizenApp() {
   }, []);
 
   function stopLiveInputs() {
+    recognitionRef.current?.stop();
+    recognitionRef.current = null;
+    liveSocketRef.current?.close();
+    liveSocketRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
     setCameraStatus("idle");
+    setMicrophoneStatus("idle");
+    setLiveAgentStatus("offline");
+  }
+
+  function currentLocationPayload(confirmed = false) {
+    return currentLocation
+      ? {
+          label: null,
+          latitude: currentLocation.latitude,
+          longitude: currentLocation.longitude,
+          accuracy_meters: currentLocation.accuracy,
+          street_address: null,
+          intersection: null,
+          neighborhood: null,
+          borough: null,
+          source: "browser geolocation",
+          confirmed,
+        }
+      : undefined;
   }
 
   function locationLabel() {
     if (currentLocation) {
-      return `${currentLocation.latitude.toFixed(5)}, ${currentLocation.longitude.toFixed(5)}`;
+      return "Phone location captured";
     }
     if (locationStatus === "requesting") {
       return "Requesting";
@@ -135,9 +240,25 @@ export default function CitizenApp() {
     if (locationStatus === "denied") {
       return "Needs permission";
     }
-    return demoVariant === "confirmed_location"
-      ? "Confirmed crossing"
-      : "Needs confirmation";
+    return "Needs confirmation";
+  }
+
+  function inferIssueVariant(description: string) {
+    const normalized = description.toLowerCase();
+    if (
+      /\b(trash|garbage|refuse|rubbish|bags?|bagged|sanitation|dumping)\b/.test(
+        normalized,
+      )
+    ) {
+      return demoVariants.find((variant) => variant.id === "street_trash_bags")!;
+    }
+    if (/\b(drain|catch basin|sewer|clogged|leaves)\b/.test(normalized)) {
+      return demoVariants.find((variant) => variant.id === "visible_drain_obstruction")!;
+    }
+    if (/\b(crosswalk|sidewalk|blocked|blocking|traffic lane)\b/.test(normalized)) {
+      return demoVariants.find((variant) => variant.id === "blocked_crosswalk")!;
+    }
+    return demoVariants[0];
   }
 
   function startReport() {
@@ -145,6 +266,12 @@ export default function CitizenApp() {
     setError(null);
     setCurrentLocation(null);
     setLocationStatus("idle");
+    setIssueDescription("");
+    setDetectedVariant(null);
+    setInterimTranscript("");
+    setLiveAgentMessage(null);
+    setCandidateFollowup(null);
+    setLiveAgentStatus("offline");
     setPhase("permissions");
     requestAnimationFrame(() => {
       livePanelRef.current?.scrollIntoView({
@@ -160,6 +287,8 @@ export default function CitizenApp() {
     try {
       await requestCamera();
       await requestLocation();
+      prepareSpeechRecognition();
+      connectLiveAgent();
       setPhase("observing");
     } catch (err) {
       setError(
@@ -170,6 +299,70 @@ export default function CitizenApp() {
     } finally {
       setCaptureLoading(false);
     }
+  }
+
+  function connectLiveAgent() {
+    const url = liveWebSocketUrl();
+    if (!url) {
+      setLiveAgentStatus("fallback");
+      return;
+    }
+
+    liveSocketRef.current?.close();
+    setLiveAgentStatus("connecting");
+    const socket = new WebSocket(url);
+    liveSocketRef.current = socket;
+
+    socket.onopen = () => {
+      setLiveAgentStatus("ready");
+      socket.send(
+        JSON.stringify({
+          type: "start",
+          payload: { location: currentLocationPayload(false) },
+        }),
+      );
+    };
+    socket.onmessage = (event) => {
+      const liveEvent = JSON.parse(event.data) as LiveAgentEvent;
+      setLiveAgentMessage(liveEvent.message);
+      if (liveEvent.type === "candidate_detected" && liveEvent.payload.demo_variant) {
+        const nextVariant = demoVariants.find(
+          (variant) => variant.id === liveEvent.payload.demo_variant,
+        );
+        if (nextVariant) {
+          setDetectedVariant(nextVariant);
+          setCandidateFollowup(liveEvent.payload.followup ?? null);
+          setPhase("candidate");
+        }
+        setLiveAgentStatus("ready");
+      } else if (liveEvent.type === "followup_required") {
+        setPhase("followup");
+        setLiveAgentStatus("ready");
+      } else if (liveEvent.type === "location_confirmation_required") {
+        setError(liveEvent.message);
+        setLiveAgentStatus("ready");
+      } else if (liveEvent.type === "draft_ready" && liveEvent.payload.report) {
+        setDraft(liveEvent.payload.report);
+        setPhase("draft");
+        setLoading(false);
+        stopLiveInputs();
+      } else if (liveEvent.type === "error") {
+        setError(liveEvent.message);
+        setLoading(false);
+        setLiveAgentStatus("fallback");
+      } else if (liveEvent.type === "session_started") {
+        setLiveAgentStatus("ready");
+      }
+    };
+    socket.onerror = () => {
+      setLoading(false);
+      setLiveAgentStatus("fallback");
+    };
+    socket.onclose = () => {
+      setLiveAgentStatus((current) =>
+        current === "connecting" || current === "ready" ? "fallback" : current,
+      );
+    };
   }
 
   async function requestCamera() {
@@ -226,11 +419,180 @@ export default function CitizenApp() {
     });
   }
 
-  function showCandidate() {
-    setPhase("candidate");
+  function speechRecognitionConstructor() {
+    if (typeof window === "undefined") {
+      return null;
+    }
+
+    const speechWindow = window as Window & {
+      SpeechRecognition?: SpeechRecognitionConstructor;
+      webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    };
+
+    return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
+  }
+
+  function prepareSpeechRecognition() {
+    if (!speechRecognitionConstructor()) {
+      setMicrophoneStatus("unavailable");
+      return;
+    }
+
+    setMicrophoneStatus("idle");
+  }
+
+  function startVoiceCapture() {
+    const SpeechRecognition = speechRecognitionConstructor();
+    if (!SpeechRecognition) {
+      setMicrophoneStatus("unavailable");
+      setError(
+        "Voice transcription is not available in this browser. Type the description below.",
+      );
+      return;
+    }
+
+    setError(null);
+    setInterimTranscript("");
+    if (phase === "observing") {
+      setIssueDescription("");
+      setDetectedVariant(null);
+    }
+    setMicrophoneStatus("requesting");
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+    recognition.onresult = (event) => {
+      let finalText = "";
+      let interimText = "";
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        if (result.isFinal) {
+          finalText += result[0].transcript;
+        } else {
+          interimText += result[0].transcript;
+        }
+      }
+
+      if (finalText.trim()) {
+        setIssueDescription((current) =>
+          phase === "observing"
+            ? finalText.trim()
+            : `${current ? `${current.trim()} ` : ""}${finalText.trim()}`,
+        );
+      }
+      setInterimTranscript(interimText.trim());
+      setMicrophoneStatus("active");
+    };
+    recognition.onerror = (event) => {
+      setMicrophoneStatus(event.error === "not-allowed" ? "denied" : "unavailable");
+      setError("Voice transcription stopped. You can type the description below.");
+    };
+    recognition.onend = () => {
+      setInterimTranscript("");
+      setMicrophoneStatus((current) => (current === "active" ? "idle" : current));
+    };
+
+    recognitionRef.current = recognition;
+    recognition.start();
+  }
+
+  async function showCandidate() {
+    if (!issueDescription.trim()) {
+      setError("Tell the agent what you are seeing before detecting the issue.");
+      return;
+    }
+    setError(null);
+    if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
+      setLiveAgentStatus("thinking");
+      liveSocketRef.current.send(
+        JSON.stringify({
+          type: "observation",
+          payload: {
+            transcript: issueDescription.trim(),
+            image_summary: activeVariant.candidate,
+            location: currentLocationPayload(false),
+          },
+        }),
+      );
+      return;
+    }
+    setLiveAgentStatus("thinking");
+    const imageFrame = captureCameraFrame();
+    try {
+      const classified = await classifyLiveObservation(
+        issueDescription.trim(),
+        imageFrame
+          ? "Still frame captured from the resident's active camera preview."
+          : activeVariant.candidate,
+        imageFrame,
+        currentLocationPayload(false),
+      );
+      const nextVariant = demoVariants.find(
+        (variant) => variant.id === classified.demo_variant,
+      );
+      setDetectedVariant(nextVariant ?? inferIssueVariant(issueDescription));
+      setLiveAgentMessage(classified.confirmation);
+      setCandidateFollowup(classified.followup);
+      setPhase("candidate");
+      setLiveAgentStatus(
+        classified.model_source === "deterministic-fallback" ? "fallback" : "ready",
+      );
+    } catch {
+      setDetectedVariant(inferIssueVariant(issueDescription));
+      setPhase("candidate");
+      setLiveAgentStatus("fallback");
+    }
+  }
+
+  function captureCameraFrame() {
+    const video = videoRef.current;
+    if (!video || cameraStatus !== "active" || video.videoWidth === 0) {
+      return undefined;
+    }
+
+    const canvas = document.createElement("canvas");
+    const maxWidth = 640;
+    const scale = Math.min(1, maxWidth / video.videoWidth);
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+    const context = canvas.getContext("2d");
+    if (!context) {
+      return undefined;
+    }
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/jpeg", 0.72);
+  }
+
+  function retryDescription() {
+    setIssueDescription("");
+    setInterimTranscript("");
+    setDetectedVariant(null);
+    setLiveAgentMessage(null);
+    setCandidateFollowup(null);
+    setPhase("observing");
+    setError(null);
+  }
+
+  function correctCandidate() {
+    setDetectedVariant(null);
+    setInterimTranscript("");
+    setLiveAgentMessage(null);
+    setCandidateFollowup(null);
+    setPhase("observing");
+    setError(null);
   }
 
   function confirmIntent() {
+    if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
+      setLiveAgentStatus("thinking");
+      liveSocketRef.current.send(
+        JSON.stringify({ type: "intent_confirmed", payload: {} }),
+      );
+      return;
+    }
+    setLiveAgentMessage(candidateFollowup || activeVariant.followup);
     setPhase("followup");
   }
 
@@ -238,16 +600,23 @@ export default function CitizenApp() {
     setLoading(true);
     setError(null);
     try {
+      if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
+        liveSocketRef.current.send(
+          JSON.stringify({
+            type: "location_confirmed",
+            payload: { location: currentLocationPayload(true) },
+          }),
+        );
+        liveSocketRef.current.send(
+          JSON.stringify({ type: "create_draft", payload: {} }),
+        );
+        return;
+      }
       const report = await createDemoDraft(
-        demoVariant,
-        currentLocation
-          ? {
-              label: "Current phone location",
-              latitude: currentLocation.latitude,
-              longitude: currentLocation.longitude,
-              confirmed: false,
-            }
-          : undefined,
+        activeVariant.scenario,
+        activeVariant.id,
+        currentLocationPayload(false),
+        issueDescription.trim() || undefined,
       );
       setDraft(report);
       setPhase("draft");
@@ -255,7 +624,9 @@ export default function CitizenApp() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not create report draft.");
     } finally {
-      setLoading(false);
+      if (liveSocketRef.current?.readyState !== WebSocket.OPEN) {
+        setLoading(false);
+      }
     }
   }
 
@@ -301,6 +672,12 @@ export default function CitizenApp() {
     setError(null);
     setCurrentLocation(null);
     setLocationStatus("idle");
+    setIssueDescription("");
+    setDetectedVariant(null);
+    setInterimTranscript("");
+    setLiveAgentMessage(null);
+    setCandidateFollowup(null);
+    setLiveAgentStatus("offline");
   }
 
   return (
@@ -334,11 +711,6 @@ export default function CitizenApp() {
               <h2 className="mt-1 text-xl font-bold text-ink">
                 Report with camera, voice, and location
               </h2>
-              <p className="mt-3 text-sm leading-6 text-ink/70">
-                This simulator models the live agent flow before browser media and
-                Gemini Live are wired.
-              </p>
-
               <div className="mt-4 grid grid-cols-1 gap-2">
                 <StatusPill
                   kind="camera"
@@ -354,7 +726,17 @@ export default function CitizenApp() {
                 <StatusPill
                   kind="microphone"
                   label="Microphone"
-                  state={phase === "ready" ? "Ready on start" : "Voice simulated"}
+                  state={
+                    microphoneStatus === "active"
+                      ? "Listening"
+                      : microphoneStatus === "requesting"
+                        ? "Requesting"
+                        : microphoneStatus === "unavailable"
+                          ? "Type fallback"
+                          : phase === "ready"
+                            ? "Ready on start"
+                            : "Ready"
+                  }
                 />
                 <StatusPill
                   kind="location"
@@ -366,42 +748,21 @@ export default function CitizenApp() {
                   label="Data chain"
                   state={phase === "ready" ? "Generated after draft" : "Visible"}
                 />
-              </div>
-
-              <div className="mt-5">
-                <div className="flex items-center gap-2">
-                  <SlidersHorizontal size={16} className="text-civic" />
-                  <p className="text-xs font-semibold uppercase tracking-wide text-ink/55">
-                    Demo controls
-                  </p>
-                </div>
-                <div className="mt-2 grid grid-cols-2 gap-2">
-                  {demoVariants.map((variant) => {
-                    const selected = demoVariant === variant.id;
-                    return (
-                      <button
-                        key={variant.id}
-                        type="button"
-                        onClick={() => setDemoVariant(variant.id)}
-                        disabled={loading}
-                        className={`focus-ring min-h-16 rounded-md border px-3 py-2 text-left transition ${
-                          selected
-                            ? "border-civic bg-civic text-white"
-                            : "border-ink/10 bg-field text-ink hover:border-civic"
-                        }`}
-                      >
-                        <span className="block text-sm font-bold">{variant.label}</span>
-                        <span
-                          className={`mt-1 block text-xs leading-4 ${
-                            selected ? "text-white/78" : "text-ink/60"
-                          }`}
-                        >
-                          {variant.state}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
+                <StatusPill
+                  kind="dtpr"
+                  label="Live agent"
+                  state={
+                    liveAgentStatus === "ready"
+                      ? "WebSocket ready"
+                      : liveAgentStatus === "thinking"
+                        ? "Processing"
+                        : liveAgentStatus === "fallback"
+                          ? "Local simulator"
+                          : liveAgentStatus === "connecting"
+                            ? "Connecting"
+                            : "Offline"
+                  }
+                />
               </div>
 
               <button
@@ -451,7 +812,9 @@ export default function CitizenApp() {
                 <h2 className="mt-1 text-2xl font-bold text-ink">
                   {phase === "ready"
                     ? "Start a live report"
-                    : activeVariant.candidate}
+                    : phase === "observing"
+                      ? "Describe what you see"
+                      : activeVariant.candidate}
                 </h2>
                 <div className="mt-4 overflow-hidden rounded-md bg-ink text-white">
                   <div className="relative aspect-[4/5] min-h-[300px] bg-black sm:aspect-video sm:min-h-[360px]">
@@ -486,14 +849,18 @@ export default function CitizenApp() {
                     </div>
                     <div>
                         <p className="text-xl font-black sm:text-2xl">
-                        {cameraStatus === "active"
-                          ? activeVariant.candidate
-                          : "Point your camera at the issue."}
+                        {cameraStatus !== "active"
+                          ? "Point your camera at the issue."
+                          : phase === "candidate" || phase === "followup"
+                            ? activeVariant.candidate
+                            : "Describe what you see."}
                       </p>
                       <p className="mt-3 max-w-xl text-sm leading-6 text-white/72">
                         {phase === "ready"
                           ? "The live agent will observe, listen, confirm intent, and draft only after reviewable context is available."
-                          : activeVariant.confirmation}
+                          : phase === "observing"
+                            ? "Tell me what you are seeing, then I will identify the likely 311 issue."
+                            : activeVariant.confirmation}
                       </p>
                     </div>
                     <div className="flex flex-wrap gap-2 text-xs font-semibold">
@@ -519,13 +886,76 @@ export default function CitizenApp() {
                         {phase === "permissions" &&
                           "I will use camera, microphone, and location only for this report flow. Continue?"}
                         {phase === "observing" &&
-                          "I am looking for the issue and listening for your description."}
-                        {phase === "candidate" && activeVariant.confirmation}
-                        {phase === "followup" && activeVariant.followup}
+                          (liveAgentMessage ||
+                            "Tell me what you are seeing, then I will identify the likely 311 issue.")}
+                        {phase === "candidate" &&
+                          (liveAgentMessage || activeVariant.confirmation)}
+                        {phase === "followup" && (liveAgentMessage || activeVariant.followup)}
                       </p>
                     </div>
                   </div>
                 </div>
+
+                {(phase === "observing" ||
+                  phase === "candidate" ||
+                  phase === "followup") && (
+                  <div className="mt-3 rounded-md border border-ink/10 bg-white p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-xs font-semibold uppercase tracking-wide text-ink/55">
+                        Resident description
+                      </span>
+                      <div className="flex shrink-0 items-center gap-2">
+                        {phase === "observing" && issueDescription && (
+                          <button
+                            type="button"
+                            onClick={retryDescription}
+                            className="focus-ring min-h-10 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm font-bold text-ink transition hover:border-civic hover:text-civic"
+                          >
+                            Clear
+                          </button>
+                        )}
+                        {(phase === "candidate" || phase === "followup") && (
+                          <button
+                            type="button"
+                            onClick={correctCandidate}
+                            className="focus-ring min-h-10 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm font-bold text-ink transition hover:border-civic hover:text-civic"
+                          >
+                            Correct
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={startVoiceCapture}
+                          disabled={microphoneStatus === "active"}
+                          className="focus-ring flex min-h-10 items-center justify-center gap-2 rounded-md bg-civic px-3 py-2 text-sm font-bold text-white transition hover:bg-ink disabled:cursor-wait disabled:bg-ink/35"
+                        >
+                          <Mic size={16} aria-hidden="true" />
+                          {microphoneStatus === "active" ? "Listening..." : "Speak"}
+                        </button>
+                      </div>
+                    </div>
+                    {(interimTranscript || issueDescription) && (
+                      <div className="mt-2 rounded-md bg-field p-3 text-sm leading-6 text-ink/72">
+                        {issueDescription}
+                        {interimTranscript && (
+                          <span className="text-ink/45"> {interimTranscript}</span>
+                        )}
+                      </div>
+                    )}
+                    <textarea
+                      value={issueDescription}
+                      onChange={(event) => {
+                        setIssueDescription(event.target.value);
+                        if (phase === "observing") {
+                          setDetectedVariant(null);
+                        }
+                      }}
+                      rows={2}
+                      className="focus-ring mt-2 w-full resize-none rounded-md border border-ink/15 bg-field px-3 py-2 text-base leading-6 text-ink"
+                      placeholder="Voice fallback: There are trash bags blocking the sidewalk here."
+                    />
+                  </div>
+                )}
 
                 <div className="mt-5 grid grid-cols-1 gap-2 sm:grid-cols-2">
                   {phase === "permissions" && (
@@ -547,6 +977,7 @@ export default function CitizenApp() {
                     <button
                       type="button"
                       onClick={showCandidate}
+                      disabled={!issueDescription.trim()}
                       className="focus-ring flex min-h-12 items-center justify-center gap-2 rounded-md bg-ink px-4 py-3 font-bold text-white transition hover:bg-civic"
                     >
                       <Camera size={18} aria-hidden="true" />
@@ -554,14 +985,23 @@ export default function CitizenApp() {
                     </button>
                   )}
                   {phase === "candidate" && (
-                    <button
-                      type="button"
-                      onClick={confirmIntent}
-                      className="focus-ring flex min-h-12 items-center justify-center gap-2 rounded-md bg-ink px-4 py-3 font-bold text-white transition hover:bg-civic"
-                    >
-                      <CheckCircle2 size={18} aria-hidden="true" />
-                      Yes, Report This
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        onClick={confirmIntent}
+                        className="focus-ring flex min-h-12 items-center justify-center gap-2 rounded-md bg-ink px-4 py-3 font-bold text-white transition hover:bg-civic"
+                      >
+                        <CheckCircle2 size={18} aria-hidden="true" />
+                        Yes, Report This
+                      </button>
+                      <button
+                        type="button"
+                        onClick={correctCandidate}
+                        className="focus-ring flex min-h-12 items-center justify-center rounded-md border border-ink/15 bg-white px-4 py-3 font-bold text-ink transition hover:border-civic hover:text-civic"
+                      >
+                        No, Correct Issue
+                      </button>
+                    </>
                   )}
                   {phase === "followup" && (
                     <button

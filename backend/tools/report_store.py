@@ -80,9 +80,9 @@ class InMemoryReportStore:
         return item.model_copy(
             update={
                 "reason": (
-                    "Resident confirmed the exact crossing for this draft."
+                    "Resident confirmed the exact location for this draft."
                     if report.location.confirmed
-                    else "Resident must confirm the exact crossing before live submission."
+                    else "Resident must confirm the exact location before live submission."
                 ),
                 "current_value": str(report.location.confirmed),
             }
@@ -97,9 +97,9 @@ class InMemoryReportStore:
         return item.model_copy(
             update={
                 "reason": (
-                    "Resident confirmed the exact crossing for this draft."
+                    "Resident confirmed the exact location for this draft."
                     if report.location.confirmed
-                    else "Demo location is approximate until the resident confirms it."
+                    else "Phone location is approximate until the resident confirms it."
                 ),
                 "confidence": 0.92 if report.location.confirmed else 0.68,
             }

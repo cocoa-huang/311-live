@@ -14,6 +14,7 @@ from backend.schemas import (
     UncertaintyItem,
 )
 from backend.tools.dtpr import build_demo_dtpr_chain
+from backend.tools.location_labeler import label_location
 from backend.tools.nyc_311_context import (
     CivicContextProvider,
     ContextProviderError,
@@ -109,6 +110,50 @@ DEMO_VARIANTS = {
             "context while still requiring human review."
         ),
     },
+    "street_trash_bags": {
+        "scenario": "trash_bags_on_street",
+        "category": "street_cleanliness",
+        "subcategory": "trash_bags_on_street",
+        "title": "Trash bags obstructing the street or sidewalk",
+        "service_context": "Street trash or sanitation obstruction",
+        "priority": Priority.MEDIUM,
+        "transcript": (
+            "There are trash bags piled on the street near my location. People have "
+            "to walk around them and some loose garbage is spreading."
+        ),
+        "image_summary": (
+            "Bagged trash and loose refuse appear to be set out along the curb or sidewalk."
+        ),
+        "location": DEMO_LOCATION,
+        "human_impact": (
+            "Pedestrians may need to walk around refuse, and loose trash may spread "
+            "into the street."
+        ),
+        "description": (
+            "Trash bags and loose refuse are obstructing part of the street or sidewalk "
+            "near the resident's current location."
+        ),
+        "narrative": (
+            "A resident reports trash bags and loose refuse near their current location. "
+            "The draft should preserve whether the issue is bagged trash, loose garbage, "
+            "or a sidewalk obstruction because those details affect sanitation routing."
+        ),
+        "questions": [
+            "Is this the exact location of the trash bags?",
+            "Are the bags blocking the sidewalk, curb, bike lane, or street?",
+            "Does this look like missed collection, illegal dumping, or regular set-out?",
+        ],
+        "routing_uncertainty": (
+            "Sanitation routing can depend on whether the condition is missed collection, "
+            "illegal dumping, set-out timing, or a sidewalk obstruction."
+        ),
+    },
+}
+
+
+DEFAULT_VARIANT_BY_SCENARIO = {
+    "flooding_near_school_crossing": "baseline",
+    "trash_bags_on_street": "street_trash_bags",
 }
 
 
@@ -116,32 +161,48 @@ def build_report_draft(
     request: ReportDraftRequest,
     context_provider: CivicContextProvider | None = None,
 ) -> ReportDraft:
-    if request.scenario and request.scenario != "flooding_near_school_crossing":
+    if request.scenario and request.scenario not in DEFAULT_VARIANT_BY_SCENARIO:
         raise ValueError("Unsupported scenario")
 
-    variant = DEMO_VARIANTS[request.demo_variant or "baseline"]
+    requested_scenario = request.scenario or "flooding_near_school_crossing"
+    variant_key = request.demo_variant or DEFAULT_VARIANT_BY_SCENARIO[requested_scenario]
+    variant = DEMO_VARIANTS[variant_key]
+    variant_scenario = str(variant.get("scenario", "flooding_near_school_crossing"))
+    if request.scenario and request.scenario != variant_scenario:
+        raise ValueError("Demo variant does not match scenario")
+
+    category = str(variant.get("category", "street_flooding"))
+    subcategory = str(variant.get("subcategory", "near_school_crossing"))
+    title = str(variant.get("title", "Flooding blocking a school crossing"))
+    service_context = str(
+        variant.get("service_context", "Street flooding near a school crossing")
+    )
+    priority = variant.get("priority", Priority.HIGH)
     transcript = request.transcript or str(variant["transcript"])
     image_summary = request.image_summary or str(variant["image_summary"])
-    location = request.location or variant["location"]
-    routing = fallback_route_for_category("street_flooding", "near_school_crossing")
+    location = label_location(request.location or variant["location"])
+    routing = fallback_route_for_category(category, subcategory)
     provider = context_provider or Fallback311ContextProvider()
+    context_request = request.model_copy(update={"scenario": variant_scenario})
     try:
-        civic_context = provider.context_for_report(request)
+        civic_context = provider.context_for_report(context_request)
     except ContextProviderError as exc:
-        civic_context = fallback_311_context(f"Open Data context unavailable: {exc}")
+        civic_context = fallback_311_context(
+            f"Open Data context unavailable: {exc}", variant_scenario
+        )
     location_confirmed = location.confirmed
 
     return ReportDraft(
         id=f"draft_{uuid4().hex[:10]}",
         status="draft",
-        category="street_flooding",
-        subcategory="near_school_crossing",
-        title="Flooding blocking a school crossing",
+        category=category,
+        subcategory=subcategory,
+        title=title,
         description=str(variant["description"]),
         narrative=str(variant["narrative"]),
         location=location,
         observed_at=datetime.now(timezone.utc),
-        priority=Priority.HIGH,
+        priority=priority,
         routing=routing,
         civic_context=civic_context,
         collected_inputs=[
@@ -164,7 +225,7 @@ def build_report_draft(
             ),
             InferredContext(
                 label="Likely service category",
-                value="Street flooding near a school crossing",
+                value=service_context,
                 confidence=0.76,
                 origin=DataOrigin.SELECTED,
             ),
@@ -178,9 +239,9 @@ def build_report_draft(
             HumanReviewField(
                 field="location.confirmed",
                 reason=(
-                    "Resident confirmed the exact crossing for this draft."
+                    "Resident confirmed the exact location for this draft."
                     if location_confirmed
-                    else "Resident must confirm the exact crossing before live submission."
+                    else "Resident must confirm the exact location before live submission."
                 ),
                 current_value=str(location_confirmed),
             ),
@@ -206,26 +267,34 @@ def build_report_draft(
             EvidenceItem(kind="image", summary=image_summary),
             EvidenceItem(kind="location", summary=location.label or "Approximate location"),
         ],
-        questions_asked=[
-            "Is this the exact crossing where the flooding is happening?",
-            "Is the water actively rising or blocking the full crosswalk?",
-            "Is there a visible clogged catch basin or drain?",
-        ],
+        questions_asked=variant.get(
+            "questions",
+            [
+                "Is this the exact crossing where the flooding is happening?",
+                "Is the water actively rising or blocking the full crosswalk?",
+                "Is there a visible clogged catch basin or drain?",
+            ],
+        ),
         uncertainty=[
             UncertaintyItem(
                 field="location",
                 reason=(
-                    "Resident confirmed the exact crossing for this draft."
+                    "Resident confirmed the exact location for this draft."
                     if location_confirmed
-                    else "Demo location is approximate until the resident confirms it."
+                    else "Phone location is approximate until the resident confirms it."
                 ),
                 confidence=0.92 if location_confirmed else 0.68,
             ),
             UncertaintyItem(
                 field="responsible_department",
                 reason=(
-                    "Sewer, street, and transportation safety routing can overlap; "
-                    "historical 311 context is advisory."
+                    str(
+                        variant.get(
+                            "routing_uncertainty",
+                            "Sewer, street, and transportation safety routing can overlap; "
+                            "historical 311 context is advisory.",
+                        )
+                    )
                 ),
                 confidence=max(0.74, civic_context.confidence),
             ),

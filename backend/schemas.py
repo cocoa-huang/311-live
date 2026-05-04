@@ -34,6 +34,12 @@ class Location(BaseModel):
     label: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    accuracy_meters: Optional[float] = Field(default=None, ge=0.0)
+    street_address: Optional[str] = None
+    intersection: Optional[str] = None
+    neighborhood: Optional[str] = None
+    borough: Optional[str] = None
+    source: Optional[str] = None
     confirmed: bool = False
 
 
@@ -104,18 +110,43 @@ class HumanReviewField(BaseModel):
 
 
 class ReportDraftRequest(BaseModel):
-    scenario: Optional[Literal["flooding_near_school_crossing"]] = None
+    scenario: Optional[
+        Literal["flooding_near_school_crossing", "trash_bags_on_street"]
+    ] = None
     demo_variant: Optional[
         Literal[
             "baseline",
             "confirmed_location",
             "blocked_crosswalk",
             "visible_drain_obstruction",
+            "street_trash_bags",
         ]
     ] = None
     transcript: Optional[str] = None
     image_summary: Optional[str] = None
     location: Optional[Location] = None
+
+
+class LiveClassifyRequest(BaseModel):
+    transcript: str = Field(min_length=1)
+    image_summary: Optional[str] = None
+    image_frame: Optional[str] = None
+    location: Optional[Location] = None
+
+
+class LiveClassifyResponse(BaseModel):
+    scenario: Literal["flooding_near_school_crossing", "trash_bags_on_street"]
+    demo_variant: Literal[
+        "baseline",
+        "blocked_crosswalk",
+        "visible_drain_obstruction",
+        "street_trash_bags",
+    ]
+    candidate: str
+    confirmation: str
+    followup: str
+    model_source: str
+    fallback_reason: Optional[str] = None
 
 
 class ReportConfirmRequest(BaseModel):

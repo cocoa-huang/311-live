@@ -25,6 +25,27 @@ class Settings(BaseModel):
     socrata_timeout_seconds: float = Field(
         default_factory=lambda: float(getenv("SOCRATA_TIMEOUT_SECONDS", "2.0"))
     )
+    live_model_mode: str = Field(
+        default_factory=lambda: getenv("LIVE_MODEL_MODE", "deterministic")
+    )
+    google_cloud_project: str | None = Field(
+        default_factory=lambda: getenv("GOOGLE_CLOUD_PROJECT") or None
+    )
+    google_cloud_location: str = Field(
+        default_factory=lambda: getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+    )
+    gemini_text_location: str = Field(
+        default_factory=lambda: getenv("GEMINI_TEXT_LOCATION", "global")
+    )
+    gemini_text_model: str = Field(
+        default_factory=lambda: getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
+    )
+    gemini_live_location: str = Field(
+        default_factory=lambda: getenv("GEMINI_LIVE_LOCATION", "us-central1")
+    )
+    gemini_live_model: str | None = Field(
+        default_factory=lambda: getenv("GEMINI_LIVE_MODEL") or None
+    )
 
 
 @lru_cache

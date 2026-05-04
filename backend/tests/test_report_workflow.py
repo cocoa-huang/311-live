@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from backend.agents.live_model import LiveCandidate, LiveObservation
 from backend.main import create_app
 from backend.schemas import CivicContext, ReportDraftRequest
 from backend.tools.nyc_311_context import ContextProviderError
@@ -24,6 +25,18 @@ class StubContextProvider:
 class FailingContextProvider:
     def context_for_report(self, request: ReportDraftRequest) -> CivicContext:
         raise ContextProviderError("timeout")
+
+
+class StubLiveModelAdapter:
+    async def detect_candidate(self, observation: LiveObservation) -> LiveCandidate:
+        assert "custom adapter" in observation.transcript
+        return LiveCandidate(
+            scenario="trash_bags_on_street",
+            demo_variant="street_trash_bags",
+            candidate="Adapter-selected trash report",
+            confirmation="Adapter confirmation prompt.",
+            followup="Adapter follow-up prompt.",
+        )
 
 
 def test_demo_draft_report_returns_story_routing_and_dtpr_chain() -> None:
@@ -130,6 +143,50 @@ def test_demo_draft_supports_blocked_crosswalk_variant() -> None:
     )
 
 
+def test_demo_draft_supports_street_trash_bags_scenario() -> None:
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/report/draft",
+        json={
+            "scenario": "trash_bags_on_street",
+            "demo_variant": "street_trash_bags",
+            "location": {
+                "latitude": 40.7282,
+                "longitude": -73.9864,
+                "accuracy_meters": 22,
+                "confirmed": False,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["category"] == "street_cleanliness"
+    assert payload["subcategory"] == "trash_bags_on_street"
+    assert payload["priority"] == "medium"
+    assert payload["routing"]["agency"] == "NYC DSNY"
+    assert "trash" in payload["title"].lower()
+    assert "sanitation" in payload["uncertainty"][1]["reason"].lower()
+    assert payload["civic_context"]["likely_agencies"] == ["NYC DSNY", "NYC311"]
+    assert payload["location"]["borough"] == "Manhattan"
+
+
+def test_demo_draft_rejects_mismatched_scenario_and_variant() -> None:
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/report/draft",
+        json={
+            "scenario": "trash_bags_on_street",
+            "demo_variant": "blocked_crosswalk",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Demo variant does not match scenario"
+
+
 def test_demo_draft_uses_request_provided_location() -> None:
     client = TestClient(create_app())
 
@@ -148,11 +205,43 @@ def test_demo_draft_uses_request_provided_location() -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["location"]["label"] == "Current phone location"
+    assert payload["location"]["label"] == "Near City Hall Park, Civic Center, Manhattan"
     assert payload["location"]["latitude"] == 40.7128
     assert payload["location"]["longitude"] == -74.006
-    assert payload["collected_inputs"][1]["value"] == "Current phone location"
-    assert payload["evidence"][2]["summary"] == "Current phone location"
+    assert payload["location"]["intersection"] == "Broadway and Park Row"
+    assert payload["location"]["neighborhood"] == "Civic Center"
+    assert payload["location"]["borough"] == "Manhattan"
+    assert payload["collected_inputs"][1]["value"] == (
+        "Near City Hall Park, Civic Center, Manhattan"
+    )
+    assert payload["evidence"][2]["summary"] == (
+        "Near City Hall Park, Civic Center, Manhattan"
+    )
+
+
+def test_demo_draft_labels_unlabeled_phone_coordinates() -> None:
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/report/draft",
+        json={
+            "scenario": "flooding_near_school_crossing",
+            "location": {
+                "latitude": 40.759,
+                "longitude": -73.989,
+                "accuracy_meters": 18,
+                "confirmed": False,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["location"]["label"] == (
+        "W 43rd St and 8th Ave school crossing, Theater District, Manhattan"
+    )
+    assert payload["location"]["accuracy_meters"] == 18
+    assert payload["location"]["source"] == "deterministic demo geocoder"
 
 
 def test_confirm_report_marks_existing_draft_confirmed() -> None:
@@ -246,6 +335,133 @@ def test_model_context_packet_returns_404_for_unknown_report() -> None:
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Report not found"
+
+
+def test_live_websocket_detects_candidate_and_requires_location_confirmation() -> None:
+    client = TestClient(create_app())
+
+    with client.websocket_connect("/ws/live") as websocket:
+        websocket.send_json({"type": "start", "payload": {}})
+        started = websocket.receive_json()
+        assert started["type"] == "session_started"
+
+        websocket.send_json(
+            {
+                "type": "observation",
+                "payload": {
+                    "transcript": (
+                        "There are trash bags blocking the sidewalk near my location."
+                    ),
+                    "location": {
+                        "latitude": 40.7282,
+                        "longitude": -73.9864,
+                        "accuracy_meters": 22,
+                        "confirmed": False,
+                    },
+                },
+            }
+        )
+        candidate = websocket.receive_json()
+        assert candidate["type"] == "candidate_detected"
+        assert candidate["payload"]["scenario"] == "trash_bags_on_street"
+        assert candidate["payload"]["demo_variant"] == "street_trash_bags"
+
+        websocket.send_json({"type": "intent_confirmed", "payload": {}})
+        followup = websocket.receive_json()
+        assert followup["type"] == "followup_required"
+        assert followup["payload"]["requires_location_confirmation"] is True
+
+        websocket.send_json({"type": "create_draft", "payload": {}})
+        blocked = websocket.receive_json()
+        assert blocked["type"] == "location_confirmation_required"
+
+
+def test_live_websocket_creates_reviewable_draft_after_location_confirmation() -> None:
+    client = TestClient(create_app())
+
+    with client.websocket_connect("/ws/live") as websocket:
+        websocket.send_json(
+            {
+                "type": "start",
+                "payload": {
+                    "location": {
+                        "latitude": 40.759,
+                        "longitude": -73.989,
+                        "accuracy_meters": 18,
+                        "confirmed": False,
+                    }
+                },
+            }
+        )
+        websocket.receive_json()
+        websocket.send_json(
+            {
+                "type": "observation",
+                "payload": {
+                    "transcript": "The drain is clogged and water is blocking the crosswalk.",
+                },
+            }
+        )
+        candidate = websocket.receive_json()
+        assert candidate["payload"]["demo_variant"] == "visible_drain_obstruction"
+
+        websocket.send_json({"type": "intent_confirmed", "payload": {}})
+        websocket.receive_json()
+        websocket.send_json({"type": "location_confirmed", "payload": {}})
+        location_confirmed = websocket.receive_json()
+        assert location_confirmed["payload"]["requires_location_confirmation"] is False
+
+        websocket.send_json({"type": "create_draft", "payload": {}})
+        draft_ready = websocket.receive_json()
+        assert draft_ready["type"] == "draft_ready"
+        report = draft_ready["payload"]["report"]
+        assert report["category"] == "street_flooding"
+        assert report["subcategory"] == "near_school_crossing"
+        assert report["location"]["confirmed"] is True
+        assert report["status"] == "draft"
+
+        context_response = client.get(f"/api/report/{report['id']}/model-context")
+        assert context_response.status_code == 200
+
+
+def test_live_websocket_uses_injected_model_adapter() -> None:
+    client = TestClient(create_app(live_model_adapter=StubLiveModelAdapter()))
+
+    with client.websocket_connect("/ws/live") as websocket:
+        websocket.send_json({"type": "start", "payload": {}})
+        websocket.receive_json()
+        websocket.send_json(
+            {
+                "type": "observation",
+                "payload": {"transcript": "custom adapter should classify this"},
+            }
+        )
+
+        candidate = websocket.receive_json()
+        assert candidate["type"] == "candidate_detected"
+        assert candidate["message"] == "Adapter confirmation prompt."
+        assert candidate["payload"]["candidate"] == "Adapter-selected trash report"
+        assert candidate["payload"]["scenario"] == "trash_bags_on_street"
+
+
+def test_live_classify_endpoint_uses_injected_model_adapter() -> None:
+    client = TestClient(create_app(live_model_adapter=StubLiveModelAdapter()))
+
+    response = client.post(
+        "/api/live/classify",
+        json={
+            "transcript": "custom adapter should classify this",
+            "image_summary": "Still frame captured from the resident camera.",
+            "image_frame": "data:image/jpeg;base64,/9j/",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["scenario"] == "trash_bags_on_street"
+    assert payload["demo_variant"] == "street_trash_bags"
+    assert payload["candidate"] == "Adapter-selected trash report"
+    assert payload["model_source"] == "deterministic"
 
 
 def test_confirm_report_returns_404_for_unknown_report() -> None:
