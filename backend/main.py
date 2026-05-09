@@ -1,6 +1,19 @@
+import asyncio
+import base64
+import json
+import logging
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.agents.gemini_live_session import (
+    AudioChunkEvent,
+    GeminiLiveSessionManager,
+    SetupCompleteEvent,
+    ToolCallEvent,
+    TranscriptEvent,
+    TurnCompleteEvent,
+)
 from backend.agents.live_model import (
     LiveModelAdapter,
     LiveObservation,
@@ -23,6 +36,8 @@ from backend.schemas import (
 from backend.settings import get_settings
 from backend.tools.nyc_311_context import CivicContextProvider, provider_from_settings
 from backend.tools.report_store import report_store
+
+logger = logging.getLogger("311-live")
 
 
 def create_app(
@@ -115,31 +130,212 @@ def create_app(
     @app.websocket("/ws/live")
     async def live_agent(websocket: WebSocket) -> None:
         await websocket.accept()
-        session = LiveSession(resolved_context_provider, resolved_live_model_adapter)
-        try:
-            while True:
-                message = await websocket.receive_json()
-                message_type = message.get("type")
-                payload = message.get("payload") or {}
-                if message_type == "start":
-                    event = session.start(payload)
-                elif message_type == "observation":
-                    event = await session.observe(payload)
-                elif message_type == "intent_confirmed":
-                    event = session.confirm_intent()
-                elif message_type == "location_confirmed":
-                    event = session.confirm_location(payload)
-                elif message_type == "create_draft":
-                    event = session.create_draft()
-                    if event.type == "draft_ready":
-                        report_store.save(ReportDraft.model_validate(event.payload["report"]))
-                else:
-                    event = session._event("error", f"Unsupported live event: {message_type}")
-                await websocket.send_json(event.model_dump(mode="json"))
-        except WebSocketDisconnect:
-            return
+        if settings.live_model_mode in {"vertex", "gemini", "gemini-live"}:
+            await _run_gemini_live_session(
+                websocket, settings, resolved_context_provider
+            )
+        else:
+            await _run_deterministic_session(
+                websocket, resolved_context_provider, resolved_live_model_adapter
+            )
 
     return app
+
+
+async def _run_deterministic_session(
+    websocket: WebSocket,
+    context_provider,
+    live_model_adapter,
+) -> None:
+    session = LiveSession(context_provider, live_model_adapter)
+    try:
+        while True:
+            message = await websocket.receive_json()
+            message_type = message.get("type")
+            payload = message.get("payload") or {}
+            if message_type == "start":
+                event = session.start(payload)
+            elif message_type == "observation":
+                event = await session.observe(payload)
+            elif message_type == "intent_confirmed":
+                event = session.confirm_intent()
+            elif message_type == "location_confirmed":
+                event = session.confirm_location(payload)
+            elif message_type == "create_draft":
+                event = session.create_draft()
+                if event.type == "draft_ready":
+                    report_store.save(ReportDraft.model_validate(event.payload["report"]))
+            else:
+                event = session._event("error", f"Unsupported live event: {message_type}")
+            await websocket.send_json(event.model_dump(mode="json"))
+    except WebSocketDisconnect:
+        return
+
+
+async def _run_gemini_live_session(
+    websocket: WebSocket,
+    settings,
+    context_provider,
+) -> None:
+    from backend.agents.live_model import infer_live_report_path
+    from backend.agents.report_builder import build_report_draft
+    from backend.schemas import Location, ReportDraftRequest
+
+    logger.info("gemini-live: opening Gemini session")
+    async with GeminiLiveSessionManager(settings) as manager:
+        logger.info("gemini-live: Gemini session context opened")
+        ctx: dict = {"location_label": None}
+        audio_frames = 0
+        image_frames = 0
+
+        async def _recv_from_frontend() -> None:
+            nonlocal audio_frames, image_frames
+            try:
+                while True:
+                    msg = await websocket.receive()
+                    if msg["type"] == "websocket.disconnect":
+                        logger.info("gemini-live: frontend websocket disconnected")
+                        return
+                    if msg.get("bytes"):
+                        audio_frames += 1
+                        if audio_frames == 1 or audio_frames % 25 == 0:
+                            logger.info(
+                                "gemini-live: received audio frame #%s (%s bytes)",
+                                audio_frames,
+                                len(msg["bytes"]),
+                            )
+                        await manager.send_audio(msg["bytes"])
+                    elif msg.get("text"):
+                        data = json.loads(msg["text"])
+                        msg_type = data.get("type")
+                        logger.info("gemini-live: received frontend event %s", msg_type)
+                        if msg_type == "text":
+                            await manager.send_text(data.get("text", ""))
+                        elif msg_type == "image_frame":
+                            image_frames += 1
+                            if image_frames == 1 or image_frames % 5 == 0:
+                                logger.info(
+                                    "gemini-live: received image frame #%s",
+                                    image_frames,
+                                )
+                            raw = data.get("data", "")
+                            if "," in raw:
+                                raw = raw.split(",", 1)[1]
+                            await manager.send_image(base64.b64decode(raw))
+                        elif msg_type == "start":
+                            loc = (data.get("payload") or {}).get("location") or {}
+                            lat = loc.get("latitude")
+                            lng = loc.get("longitude")
+                            if lat is not None and lng is not None:
+                                ctx["location_label"] = (
+                                    f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, "
+                                    f"{abs(lng):.4f}°{'E' if lng >= 0 else 'W'}"
+                                )
+            except (WebSocketDisconnect, RuntimeError):
+                pass
+
+        async def _recv_from_gemini() -> None:
+            try:
+                async for event in manager.receive_events():
+                    if isinstance(event, SetupCompleteEvent):
+                        logger.info("gemini-live: setup_complete received")
+                        await asyncio.sleep(0.15)
+                        if ctx.get("location_label"):
+                            await manager.send_text(
+                                f"[System: Reporter GPS is approximately {ctx['location_label']}. "
+                                f"Reference this when discussing location.]"
+                            )
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "session_ready",
+                                    "session_id": manager.session_id,
+                                }
+                            )
+                        )
+                        logger.info("gemini-live: session_ready sent to frontend")
+                    elif isinstance(event, AudioChunkEvent):
+                        logger.info(
+                            "gemini-live: sending audio chunk (%s bytes)",
+                            len(event.data),
+                        )
+                        await websocket.send_bytes(event.data)
+                    elif isinstance(event, TranscriptEvent):
+                        logger.info(
+                            "gemini-live: transcript role=%s finished=%s text=%r",
+                            event.role,
+                            event.finished,
+                            event.text,
+                        )
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "transcript",
+                                    "role": event.role,
+                                    "text": event.text,
+                                    "finished": event.finished,
+                                }
+                            )
+                        )
+                    elif isinstance(event, ToolCallEvent):
+                        logger.info("gemini-live: tool call %s", event.name)
+                        if event.name == "create_report_draft":
+                            args = event.args
+                            issue_desc = args.get("issue_description", "")
+                            loc_desc = args.get("location_description", "")
+                            severity = args.get("severity_details", "")
+                            scenario, demo_variant = infer_live_report_path(issue_desc)
+                            full_transcript = (
+                                f"{issue_desc}. {severity}".strip(". ")
+                                if severity
+                                else issue_desc
+                            )
+                            request = ReportDraftRequest(
+                                scenario=scenario,  # type: ignore[arg-type]
+                                demo_variant=demo_variant,  # type: ignore[arg-type]
+                                transcript=full_transcript,
+                                location=Location(
+                                    label=loc_desc,
+                                    source="gemini-live-confirmed",
+                                    confirmed=True,
+                                ),
+                            )
+                            draft = build_report_draft(request, context_provider)
+                            report_store.save(draft)
+                            await manager.respond_to_tool_call(
+                                event.call_id,
+                                event.name,
+                                {"status": "success", "report_id": draft.id},
+                            )
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "draft_ready",
+                                        "payload": {
+                                            "report_id": draft.id,
+                                            "report": draft.model_dump(mode="json"),
+                                        },
+                                    }
+                                )
+                            )
+                    elif isinstance(event, TurnCompleteEvent):
+                        logger.info("gemini-live: turn_complete")
+                        await websocket.send_text(json.dumps({"type": "turn_complete"}))
+            except (WebSocketDisconnect, RuntimeError, asyncio.CancelledError):
+                pass
+
+        fe_task = asyncio.create_task(_recv_from_frontend())
+        gm_task = asyncio.create_task(_recv_from_gemini())
+
+        done, pending = await asyncio.wait(
+            [fe_task, gm_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = create_app()

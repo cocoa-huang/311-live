@@ -152,9 +152,15 @@ const demoVariants: Array<{
 export default function CitizenApp() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const liveSocketRef = useRef<WebSocket | null>(null);
   const livePanelRef = useRef<HTMLElement | null>(null);
+  const audioInContextRef = useRef<AudioContext | null>(null);
+  const audioInWorkletRef = useRef<AudioWorkletNode | null>(null);
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const playbackCursorRef = useRef<number>(0);
+  const cameraFrameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [mounted, setMounted] = useState(false);
   const [phase, setPhase] = useState<Phase>("ready");
   const [draft, setDraft] = useState<ReportDraft | null>(null);
@@ -177,6 +183,9 @@ export default function CitizenApp() {
   const [confirming, setConfirming] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [userSpeaking, setUserSpeaking] = useState<string>("");
+
+  const geminiLiveMode = !!liveWebSocketUrl();
   const activeVariant = detectedVariant ?? inferIssueVariant(issueDescription);
 
   useEffect(() => {
@@ -202,12 +211,24 @@ export default function CitizenApp() {
     liveSocketRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    micStreamRef.current?.getTracks().forEach((track) => track.stop());
+    micStreamRef.current = null;
+    if (cameraFrameIntervalRef.current !== null) {
+      clearInterval(cameraFrameIntervalRef.current);
+      cameraFrameIntervalRef.current = null;
+    }
+    audioInWorkletRef.current = null;
+    audioInContextRef.current?.close().catch(() => {});
+    audioInContextRef.current = null;
+    playbackContextRef.current?.close().catch(() => {});
+    playbackContextRef.current = null;
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
     setCameraStatus("idle");
     setMicrophoneStatus("idle");
     setLiveAgentStatus("offline");
+    setUserSpeaking("");
   }
 
   function currentLocationPayload(confirmed = false) {
@@ -287,7 +308,11 @@ export default function CitizenApp() {
     try {
       await requestCamera();
       await requestLocation();
-      prepareSpeechRecognition();
+      if (geminiLiveMode) {
+        await requestMicrophone();
+      } else {
+        prepareSpeechRecognition();
+      }
       connectLiveAgent();
       setPhase("observing");
     } catch (err) {
@@ -311,10 +336,10 @@ export default function CitizenApp() {
     liveSocketRef.current?.close();
     setLiveAgentStatus("connecting");
     const socket = new WebSocket(url);
+    socket.binaryType = "arraybuffer";
     liveSocketRef.current = socket;
 
     socket.onopen = () => {
-      setLiveAgentStatus("ready");
       socket.send(
         JSON.stringify({
           type: "start",
@@ -322,38 +347,77 @@ export default function CitizenApp() {
         }),
       );
     };
-    socket.onmessage = (event) => {
-      const liveEvent = JSON.parse(event.data) as LiveAgentEvent;
-      setLiveAgentMessage(liveEvent.message);
-      if (liveEvent.type === "candidate_detected" && liveEvent.payload.demo_variant) {
-        const nextVariant = demoVariants.find(
-          (variant) => variant.id === liveEvent.payload.demo_variant,
-        );
-        if (nextVariant) {
-          setDetectedVariant(nextVariant);
-          setCandidateFollowup(liveEvent.payload.followup ?? null);
-          setPhase("candidate");
+
+    socket.onmessage = async (event) => {
+      // Binary frame = PCM audio from Gemini
+      if (event.data instanceof ArrayBuffer) {
+        playAudioChunk(event.data);
+        return;
+      }
+
+      const data = JSON.parse(event.data as string) as Record<string, unknown>;
+      const eventType = data.type as string;
+
+      // Gemini Live events
+      if (eventType === "session_ready") {
+        setLiveAgentStatus("ready");
+        if (geminiLiveMode) {
+          try {
+            await startAudioCapture(socket);
+          } catch {
+            setMicrophoneStatus("denied");
+            setError("Could not start microphone capture.");
+          }
+        }
+      } else if (eventType === "transcript") {
+        const role = data.role as string;
+        const text = data.text as string;
+        const finished = data.finished as boolean;
+        if (role === "model") {
+          setLiveAgentMessage(text);
+          setLiveAgentStatus("thinking");
+        } else if (role === "user" && finished) {
+          setUserSpeaking(text);
+        }
+      } else if (eventType === "turn_complete") {
+        setLiveAgentStatus("ready");
+      } else if (eventType === "draft_ready") {
+        const payload = data.payload as { report?: ReportDraft; report_id?: string };
+        if (payload?.report) {
+          setDraft(payload.report);
+          setPhase("draft");
+          setLoading(false);
+          stopLiveInputs();
+        }
+      // Legacy deterministic events
+      } else if (eventType === "session_started") {
+        setLiveAgentStatus("ready");
+      } else if (eventType === "candidate_detected") {
+        const payload = data.payload as LiveAgentEvent["payload"];
+        if (payload?.demo_variant) {
+          const nextVariant = demoVariants.find((v) => v.id === payload.demo_variant);
+          if (nextVariant) {
+            setDetectedVariant(nextVariant);
+            setCandidateFollowup(payload.followup ?? null);
+            setPhase("candidate");
+          }
         }
         setLiveAgentStatus("ready");
-      } else if (liveEvent.type === "followup_required") {
+      } else if (eventType === "followup_required") {
         setPhase("followup");
         setLiveAgentStatus("ready");
-      } else if (liveEvent.type === "location_confirmation_required") {
-        setError(liveEvent.message);
+      } else if (eventType === "location_confirmation_required") {
+        const msg = (data as { message?: string }).message ?? "Confirm location.";
+        setError(msg);
         setLiveAgentStatus("ready");
-      } else if (liveEvent.type === "draft_ready" && liveEvent.payload.report) {
-        setDraft(liveEvent.payload.report);
-        setPhase("draft");
-        setLoading(false);
-        stopLiveInputs();
-      } else if (liveEvent.type === "error") {
-        setError(liveEvent.message);
+      } else if (eventType === "error") {
+        const msg = (data as { message?: string }).message ?? "Live agent error.";
+        setError(msg);
         setLoading(false);
         setLiveAgentStatus("fallback");
-      } else if (liveEvent.type === "session_started") {
-        setLiveAgentStatus("ready");
       }
     };
+
     socket.onerror = () => {
       setLoading(false);
       setLiveAgentStatus("fallback");
@@ -390,6 +454,116 @@ export default function CitizenApp() {
       setCameraStatus("denied");
       throw err;
     }
+  }
+
+  async function requestMicrophone() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMicrophoneStatus("unavailable");
+      return;
+    }
+    setMicrophoneStatus("requesting");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+      micStreamRef.current = stream;
+      setMicrophoneStatus("idle");
+    } catch {
+      setMicrophoneStatus("denied");
+    }
+  }
+
+  async function startAudioCapture(socket: WebSocket) {
+    if (audioInContextRef.current) return;
+    if (!micStreamRef.current) return;
+
+    const AudioContextClass =
+      window.AudioContext ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+
+    // 16 kHz capture context — browser resamples mic stream automatically
+    const inCtx = new AudioContextClass({ sampleRate: 16000 });
+    audioInContextRef.current = inCtx;
+
+    // Playback context at 24 kHz, created here while close to a user gesture
+    const outCtx = new AudioContextClass({ sampleRate: 24000 });
+    playbackContextRef.current = outCtx;
+    playbackCursorRef.current = 0;
+
+    // AudioWorklet via Blob URL — batches 100ms of 16kHz PCM before sending
+    // 128 samples/chunk at 16kHz ≈ 8ms; 1600 samples ≈ 100ms → ~10 msg/sec instead of 125
+    const workletCode = `
+      class PcmCapture extends AudioWorkletProcessor {
+        constructor() { super(); this._buf = []; this._size = 0; this._target = 1600; }
+        process(inputs) {
+          const ch = inputs[0]?.[0];
+          if (ch) {
+            this._buf.push(new Float32Array(ch));
+            this._size += ch.length;
+            if (this._size >= this._target) {
+              const out = new Int16Array(this._size);
+              let off = 0;
+              for (const f of this._buf) {
+                for (let i = 0; i < f.length; i++) {
+                  out[off++] = Math.max(-32768, Math.min(32767, f[i] * 32768));
+                }
+              }
+              this.port.postMessage(out.buffer, [out.buffer]);
+              this._buf = []; this._size = 0;
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-capture', PcmCapture);
+    `;
+    const blob = new Blob([workletCode], { type: "application/javascript" });
+    const workletUrl = URL.createObjectURL(blob);
+    await inCtx.audioWorklet.addModule(workletUrl);
+    URL.revokeObjectURL(workletUrl);
+
+    const source = inCtx.createMediaStreamSource(micStreamRef.current);
+    const workletNode = new AudioWorkletNode(inCtx, "pcm-capture");
+    audioInWorkletRef.current = workletNode;
+
+    workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(e.data);
+      }
+    };
+    source.connect(workletNode);
+    setMicrophoneStatus("active");
+
+    // Send camera frames at ~1 FPS to Gemini Live for visual context
+    cameraFrameIntervalRef.current = setInterval(() => {
+      if (socket.readyState !== WebSocket.OPEN || !streamRef.current) return;
+      const frame = captureCameraFrame();
+      if (frame) {
+        socket.send(JSON.stringify({ type: "image_frame", data: frame }));
+      }
+    }, 1000);
+  }
+
+  function playAudioChunk(buffer: ArrayBuffer) {
+    const ctx = playbackContextRef.current;
+    if (!ctx) return;
+
+    const int16 = new Int16Array(buffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / 32768;
+    }
+
+    const audioBuffer = ctx.createBuffer(1, float32.length, 24000);
+    audioBuffer.copyToChannel(float32, 0);
+
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+
+    const startAt = Math.max(ctx.currentTime, playbackCursorRef.current);
+    source.start(startAt);
+    playbackCursorRef.current = startAt + audioBuffer.duration;
   }
 
   async function requestLocation() {
@@ -853,13 +1027,17 @@ export default function CitizenApp() {
                           ? "Point your camera at the issue."
                           : phase === "candidate" || phase === "followup"
                             ? activeVariant.candidate
-                            : "Describe what you see."}
+                            : geminiLiveMode && phase === "observing"
+                              ? "Speak naturally — I'm listening."
+                              : "Describe what you see."}
                       </p>
                       <p className="mt-3 max-w-xl text-sm leading-6 text-white/72">
                         {phase === "ready"
                           ? "The live agent will observe, listen, confirm intent, and draft only after reviewable context is available."
                           : phase === "observing"
-                            ? "Tell me what you are seeing, then I will identify the likely 311 issue."
+                            ? geminiLiveMode
+                              ? "Gemini is listening and watching. Describe the issue and location."
+                              : "Tell me what you are seeing, then I will identify the likely 311 issue."
                             : activeVariant.confirmation}
                       </p>
                     </div>
@@ -878,8 +1056,10 @@ export default function CitizenApp() {
                     <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-white text-civic">
                       <Mic size={18} />
                     </div>
-                    <div>
-                      <p className="text-sm font-bold text-ink">Agent</p>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-bold text-ink">
+                        {liveAgentStatus === "thinking" ? "Agent — speaking…" : "Agent"}
+                      </p>
                       <p className="mt-1 text-sm leading-6 text-ink/72">
                         {phase === "ready" &&
                           "Tap Start Report when you are ready to capture the issue."}
@@ -887,18 +1067,27 @@ export default function CitizenApp() {
                           "I will use camera, microphone, and location only for this report flow. Continue?"}
                         {phase === "observing" &&
                           (liveAgentMessage ||
-                            "Tell me what you are seeing, then I will identify the likely 311 issue.")}
+                            (geminiLiveMode
+                              ? "Session starting — speak when ready."
+                              : "Tell me what you are seeing, then I will identify the likely 311 issue."))}
                         {phase === "candidate" &&
                           (liveAgentMessage || activeVariant.confirmation)}
                         {phase === "followup" && (liveAgentMessage || activeVariant.followup)}
                       </p>
+                      {geminiLiveMode && phase === "observing" && userSpeaking && (
+                        <p className="mt-2 rounded-sm bg-white px-2 py-1 text-xs text-ink/55">
+                          <span className="font-semibold text-ink/72">You:</span>{" "}
+                          {userSpeaking}
+                        </p>
+                      )}
                     </div>
                   </div>
                 </div>
 
                 {(phase === "observing" ||
                   phase === "candidate" ||
-                  phase === "followup") && (
+                  phase === "followup") &&
+                  !(geminiLiveMode && phase === "observing") && (
                   <div className="mt-3 rounded-md border border-ink/10 bg-white p-3">
                     <div className="flex items-center justify-between gap-3">
                       <span className="text-xs font-semibold uppercase tracking-wide text-ink/55">
@@ -973,7 +1162,7 @@ export default function CitizenApp() {
                       {captureLoading ? "Starting Capture..." : "Allow Camera + Location"}
                     </button>
                   )}
-                  {phase === "observing" && (
+                  {phase === "observing" && !geminiLiveMode && (
                     <button
                       type="button"
                       onClick={showCandidate}
@@ -983,6 +1172,24 @@ export default function CitizenApp() {
                       <Camera size={18} aria-hidden="true" />
                       Detect Candidate
                     </button>
+                  )}
+                  {phase === "observing" && geminiLiveMode && (
+                    <div className="flex min-h-12 items-center gap-2 rounded-md border border-ink/10 bg-field px-4 py-3 text-sm text-ink/55">
+                      <Loader2
+                        size={16}
+                        className={liveAgentStatus === "ready" || liveAgentStatus === "thinking" ? "animate-spin text-civic" : "text-ink/30"}
+                        aria-hidden="true"
+                      />
+                      {liveAgentStatus === "connecting"
+                        ? "Opening Gemini session…"
+                        : liveAgentStatus === "ready"
+                          ? "Listening — speak to report"
+                          : liveAgentStatus === "thinking"
+                            ? "Gemini is speaking…"
+                            : liveAgentStatus === "fallback"
+                              ? "Live session unavailable"
+                              : "Starting…"}
+                    </div>
                   )}
                   {phase === "candidate" && (
                     <>
