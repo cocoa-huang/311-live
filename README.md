@@ -120,9 +120,32 @@ export GEMINI_LIVE_LOCATION=us-central1
 export GEMINI_LIVE_MODEL=gemini-live-2.5-flash-preview-native-audio-09-2025
 ```
 
-The current Vertex path uses `GEMINI_TEXT_MODEL` for candidate classification first and tracks `GEMINI_LIVE_MODEL` for the upcoming spoken live-agent path. It falls back to deterministic behavior if credentials, model access, the SDK call, or response parsing fails.
-The earlier CityNerve reference project used Gemini 2.0 Flash for multimodal intake classification. In `live-cloud-495302`, `gemini-2.5-flash` is the currently accessible text/multimodal classification model; the native-audio Live model is reserved for the later audio response path.
-During candidate detection, the frontend captures one compressed JPEG still frame from the active camera preview and sends it with the resident transcript to the backend classifier. This is the current multimodal bridge; continuous audio/video streaming is still upcoming.
+The current Vertex path uses `GEMINI_TEXT_MODEL` for REST candidate classification and `GEMINI_LIVE_MODEL` for the local spoken Gemini Live path. Local Gemini Live testing on May 9 confirmed microphone PCM → backend WebSocket → Gemini Live → transcript/audio response works on `127.0.0.1`.
+
+The active Gemini Live demo is now a trash-bags civic intake flow near a demo geolock at East 8th Street and Avenue A, East Village, Manhattan. The prompt is structured around evidence boundaries, category correction, accessibility impact, recurrence, slot quality gates, and readiness criteria. The model should behave like a civic intake investigator rather than a form filler.
+
+During Gemini Live mode, the frontend sends:
+
+- 16 kHz PCM microphone frames over `/ws/live`
+- JPEG camera frames at startup and about 1 FPS
+- a geolocked demo location payload
+
+The backend forwards audio/image frames to Gemini, streams back 24 kHz PCM audio, streams transcripts, handles `create_report_draft`, and delays `draft_ready` until after `turn_complete` so the final spoken summary is less likely to be cut off.
+
+Latest local status: backend logs now confirm image-frame delivery (`gemini-live: received image frame #1`, `#5`, `#10`, ...), but Gemini still may answer that it cannot see anything. The next debugging target is visual grounding and frame usefulness, not frame transport. Prompt steering also still needs work because Gemini can fall back to generic intake wording instead of the intended trash-bags investigator workflow.
+
+For local laptop Gemini Live testing:
+
+```bash
+# Terminal 1
+bash -c 'set -a && source .env && set +a && unset GEMINI_API_KEY && LIVE_MODEL_MODE=gemini-live GOOGLE_CLOUD_PROJECT=live-cloud-495302 GEMINI_LIVE_MODEL=gemini-live-2.5-flash-preview-native-audio-09-2025 BACKEND_PORT=8001 .venv/bin/python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001 --log-level info'
+
+# Terminal 2
+cd frontend
+BACKEND_INTERNAL_URL=http://127.0.0.1:8001 NEXT_PUBLIC_WS_BASE_URL=ws://127.0.0.1:8001 npm run dev -- -H 127.0.0.1 -p 3001
+```
+
+Open `http://127.0.0.1:3001`.
 
 ## Phone Testing
 

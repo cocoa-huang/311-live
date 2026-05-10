@@ -179,7 +179,11 @@ def build_report_draft(
     )
     priority = variant.get("priority", Priority.HIGH)
     transcript = request.transcript or str(variant["transcript"])
-    image_summary = request.image_summary or str(variant["image_summary"])
+    image_summary = (
+        request.visual_evidence_summary
+        or request.image_summary
+        or str(variant["image_summary"])
+    )
     location = label_location(request.location or variant["location"])
     routing = fallback_route_for_category(category, subcategory)
     provider = context_provider or Fallback311ContextProvider()
@@ -207,6 +211,16 @@ def build_report_draft(
         civic_context=civic_context,
         collected_inputs=[
             CollectedInput(kind="text", value=transcript),
+            *(
+                [
+                    CollectedInput(
+                        kind="text",
+                        value=f"Resident claim: {request.resident_claim_summary}",
+                    )
+                ]
+                if request.resident_claim_summary
+                else []
+            ),
             CollectedInput(
                 kind="location",
                 value=location.label or "Location provided without a label",
@@ -217,6 +231,61 @@ def build_report_draft(
                 label="Visible condition",
                 value=image_summary,
                 confidence=0.82,
+            ),
+            *(
+                [
+                    InferredContext(
+                        label="Accessibility impact",
+                        value=request.accessibility_impact,
+                        confidence=0.74,
+                    )
+                ]
+                if request.accessibility_impact
+                else []
+            ),
+            *(
+                [
+                    InferredContext(
+                        label="Recurrence",
+                        value=request.recurrence,
+                        confidence=0.68,
+                    )
+                ]
+                if request.recurrence
+                else []
+            ),
+            *(
+                [
+                    InferredContext(
+                        label="Model category recommendation",
+                        value=request.recommended_category,
+                        confidence=0.7,
+                    )
+                ]
+                if request.recommended_category
+                else []
+            ),
+            *(
+                [
+                    InferredContext(
+                        label="Model agency recommendation",
+                        value=request.recommended_agency,
+                        confidence=0.7,
+                    )
+                ]
+                if request.recommended_agency
+                else []
+            ),
+            *(
+                [
+                    InferredContext(
+                        label="Intake slot quality",
+                        value=request.slot_quality_summary,
+                        confidence=0.78,
+                    )
+                ]
+                if request.slot_quality_summary
+                else []
             ),
             InferredContext(
                 label="Human impact",
@@ -260,6 +329,20 @@ def build_report_draft(
                     "resident's current issue."
                 ),
                 current_value=civic_context.source,
+            ),
+            *(
+                [
+                    HumanReviewField(
+                        field="remaining_uncertainty",
+                        reason=(
+                            "The live intake agent identified uncertainty that should "
+                            "remain visible during resident review."
+                        ),
+                        current_value=request.remaining_uncertainty,
+                    )
+                ]
+                if request.remaining_uncertainty
+                else []
             ),
         ],
         evidence=[
@@ -305,6 +388,17 @@ def build_report_draft(
                     "of the current condition."
                 ),
                 confidence=civic_context.confidence,
+            ),
+            *(
+                [
+                    UncertaintyItem(
+                        field="intake_quality",
+                        reason=request.remaining_uncertainty,
+                        confidence=0.42,
+                    )
+                ]
+                if request.remaining_uncertainty
+                else []
             ),
         ],
         dtpr_chain=build_demo_dtpr_chain(civic_context),

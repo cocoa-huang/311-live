@@ -149,6 +149,18 @@ const demoVariants: Array<{
   },
 ];
 
+const demoGeolockLocation = {
+  label: "East 8th Street and Avenue A, East Village, Manhattan",
+  latitude: 40.7271,
+  longitude: -73.9837,
+  accuracy_meters: 12,
+  street_address: null,
+  intersection: "East 8th Street and Avenue A",
+  neighborhood: "East Village",
+  borough: "Manhattan",
+  source: "demo geolock",
+};
+
 export default function CitizenApp() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -184,6 +196,7 @@ export default function CitizenApp() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [userSpeaking, setUserSpeaking] = useState<string>("");
+  const [cameraFramesSent, setCameraFramesSent] = useState(0);
 
   const geminiLiveMode = !!liveWebSocketUrl();
   const activeVariant = detectedVariant ?? inferIssueVariant(issueDescription);
@@ -229,9 +242,16 @@ export default function CitizenApp() {
     setMicrophoneStatus("idle");
     setLiveAgentStatus("offline");
     setUserSpeaking("");
+    setCameraFramesSent(0);
   }
 
   function currentLocationPayload(confirmed = false) {
+    if (geminiLiveMode) {
+      return {
+        ...demoGeolockLocation,
+        confirmed,
+      };
+    }
     return currentLocation
       ? {
           label: null,
@@ -313,6 +333,7 @@ export default function CitizenApp() {
       } else {
         prepareSpeechRecognition();
       }
+      setCameraFramesSent(0);
       connectLiveAgent();
       setPhase("observing");
     } catch (err) {
@@ -534,14 +555,18 @@ export default function CitizenApp() {
     source.connect(workletNode);
     setMicrophoneStatus("active");
 
-    // Send camera frames at ~1 FPS to Gemini Live for visual context
-    cameraFrameIntervalRef.current = setInterval(() => {
+    const sendCameraFrame = () => {
       if (socket.readyState !== WebSocket.OPEN || !streamRef.current) return;
       const frame = captureCameraFrame();
       if (frame) {
         socket.send(JSON.stringify({ type: "image_frame", data: frame }));
+        setCameraFramesSent((count) => count + 1);
       }
-    }, 1000);
+    };
+
+    // Send camera frames at ~1 FPS to Gemini Live for visual context
+    window.setTimeout(sendCameraFrame, 250);
+    cameraFrameIntervalRef.current = setInterval(sendCameraFrame, 1000);
   }
 
   function playAudioChunk(buffer: ArrayBuffer) {
@@ -722,7 +747,8 @@ export default function CitizenApp() {
 
   function captureCameraFrame() {
     const video = videoRef.current;
-    if (!video || cameraStatus !== "active" || video.videoWidth === 0) {
+    if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
+      video?.play().catch(() => {});
       return undefined;
     }
 
@@ -1036,7 +1062,9 @@ export default function CitizenApp() {
                           ? "The live agent will observe, listen, confirm intent, and draft only after reviewable context is available."
                           : phase === "observing"
                             ? geminiLiveMode
-                              ? "Gemini is listening and watching. Describe the issue and location."
+                              ? cameraFramesSent > 0
+                                ? "Gemini is listening with camera context. Describe the issue and severity."
+                                : "Gemini is listening. Camera context has not been sent yet."
                               : "Tell me what you are seeing, then I will identify the likely 311 issue."
                             : activeVariant.confirmation}
                       </p>
@@ -1044,7 +1072,12 @@ export default function CitizenApp() {
                     <div className="flex flex-wrap gap-2 text-xs font-semibold">
                       <span className="rounded-sm bg-white/12 px-2 py-1">Camera</span>
                       <span className="rounded-sm bg-white/12 px-2 py-1">Mic</span>
-                      <span className="rounded-sm bg-white/12 px-2 py-1">Location</span>
+                      <span className="rounded-sm bg-white/12 px-2 py-1">
+                        Frames {cameraFramesSent}
+                      </span>
+                      <span className="rounded-sm bg-white/12 px-2 py-1">
+                        Demo geolock
+                      </span>
                       <span className="rounded-sm bg-signal px-2 py-1">DTPR visible</span>
                     </div>
                     </div>
@@ -1068,7 +1101,9 @@ export default function CitizenApp() {
                         {phase === "observing" &&
                           (liveAgentMessage ||
                             (geminiLiveMode
-                              ? "Session starting — speak when ready."
+                              ? cameraFramesSent > 0
+                                ? "Session ready. I have demo location and camera context."
+                                : "Session ready. I have demo location; waiting for camera frames."
                               : "Tell me what you are seeing, then I will identify the likely 311 issue."))}
                         {phase === "candidate" &&
                           (liveAgentMessage || activeVariant.confirmation)}
@@ -1087,7 +1122,7 @@ export default function CitizenApp() {
                 {(phase === "observing" ||
                   phase === "candidate" ||
                   phase === "followup") &&
-                  !(geminiLiveMode && phase === "observing") && (
+                  !(geminiLiveMode && phase === "observing" && liveAgentStatus !== "fallback") && (
                   <div className="mt-3 rounded-md border border-ink/10 bg-white p-3">
                     <div className="flex items-center justify-between gap-3">
                       <span className="text-xs font-semibold uppercase tracking-wide text-ink/55">
@@ -1162,7 +1197,7 @@ export default function CitizenApp() {
                       {captureLoading ? "Starting Capture..." : "Allow Camera + Location"}
                     </button>
                   )}
-                  {phase === "observing" && !geminiLiveMode && (
+                  {phase === "observing" && (!geminiLiveMode || liveAgentStatus === "fallback") && (
                     <button
                       type="button"
                       onClick={showCandidate}

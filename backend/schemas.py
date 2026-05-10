@@ -125,6 +125,14 @@ class ReportDraftRequest(BaseModel):
     transcript: Optional[str] = None
     image_summary: Optional[str] = None
     location: Optional[Location] = None
+    resident_claim_summary: Optional[str] = None
+    visual_evidence_summary: Optional[str] = None
+    accessibility_impact: Optional[str] = None
+    recurrence: Optional[str] = None
+    recommended_category: Optional[str] = None
+    recommended_agency: Optional[str] = None
+    slot_quality_summary: Optional[str] = None
+    remaining_uncertainty: Optional[str] = None
 
 
 class LiveClassifyRequest(BaseModel):
