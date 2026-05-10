@@ -72,6 +72,12 @@ interface BrowserSpeechRecognition {
 
 type SpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
 
+interface CapturedCameraFrame {
+  dataUrl: string;
+  width: number;
+  height: number;
+}
+
 interface LiveAgentEvent {
   type:
     | "session_started"
@@ -382,6 +388,7 @@ export default function CitizenApp() {
       // Gemini Live events
       if (eventType === "session_ready") {
         setLiveAgentStatus("ready");
+        startCameraFrameCapture(socket);
         if (geminiLiveMode) {
           try {
             await startAudioCapture(socket);
@@ -469,6 +476,7 @@ export default function CitizenApp() {
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        await videoRef.current.play().catch(() => undefined);
       }
       setCameraStatus("active");
     } catch (err) {
@@ -554,18 +562,32 @@ export default function CitizenApp() {
     };
     source.connect(workletNode);
     setMicrophoneStatus("active");
+  }
+
+  async function startCameraFrameCapture(socket: WebSocket) {
+    if (cameraFrameIntervalRef.current !== null) return;
 
     const sendCameraFrame = () => {
       if (socket.readyState !== WebSocket.OPEN || !streamRef.current) return;
       const frame = captureCameraFrame();
-      if (frame) {
-        socket.send(JSON.stringify({ type: "image_frame", data: frame }));
-        setCameraFramesSent((count) => count + 1);
-      }
+      if (!frame) return;
+      socket.send(
+        JSON.stringify({
+          type: "image_frame",
+          data: frame.dataUrl,
+          width: frame.width,
+          height: frame.height,
+          captured_at: new Date().toISOString(),
+        }),
+      );
+      setCameraFramesSent((count) => count + 1);
     };
 
-    // Send camera frames at ~1 FPS to Gemini Live for visual context
-    window.setTimeout(sendCameraFrame, 250);
+    await waitForCameraFrame();
+    // Prime Gemini with visual context before or alongside the first audio turn.
+    sendCameraFrame();
+    window.setTimeout(sendCameraFrame, 200);
+    window.setTimeout(sendCameraFrame, 500);
     cameraFrameIntervalRef.current = setInterval(sendCameraFrame, 1000);
   }
 
@@ -725,7 +747,7 @@ export default function CitizenApp() {
         imageFrame
           ? "Still frame captured from the resident's active camera preview."
           : activeVariant.candidate,
-        imageFrame,
+        imageFrame?.dataUrl,
         currentLocationPayload(false),
       );
       const nextVariant = demoVariants.find(
@@ -745,7 +767,7 @@ export default function CitizenApp() {
     }
   }
 
-  function captureCameraFrame() {
+  function captureCameraFrame(): CapturedCameraFrame | undefined {
     const video = videoRef.current;
     if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
       video?.play().catch(() => {});
@@ -753,8 +775,9 @@ export default function CitizenApp() {
     }
 
     const canvas = document.createElement("canvas");
-    const maxWidth = 640;
-    const scale = Math.min(1, maxWidth / video.videoWidth);
+    const maxLongEdge = 960;
+    const longEdge = Math.max(video.videoWidth, video.videoHeight);
+    const scale = Math.min(1, maxLongEdge / longEdge);
     canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
     canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
     const context = canvas.getContext("2d");
@@ -762,7 +785,27 @@ export default function CitizenApp() {
       return undefined;
     }
     context.drawImage(video, 0, 0, canvas.width, canvas.height);
-    return canvas.toDataURL("image/jpeg", 0.72);
+    return {
+      dataUrl: canvas.toDataURL("image/jpeg", 0.84),
+      width: canvas.width,
+      height: canvas.height,
+    };
+  }
+
+  async function waitForCameraFrame() {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.videoWidth > 0 && video.videoHeight > 0) return;
+    await new Promise<void>((resolve) => {
+      const timeout = window.setTimeout(resolve, 1200);
+      const finish = () => {
+        window.clearTimeout(timeout);
+        resolve();
+      };
+      video.addEventListener("loadedmetadata", finish, { once: true });
+      video.addEventListener("canplay", finish, { once: true });
+      video.play().catch(() => finish());
+    });
   }
 
   function retryDescription() {

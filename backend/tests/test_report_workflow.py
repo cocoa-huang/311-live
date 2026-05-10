@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from backend.agents.live_model import LiveCandidate, LiveObservation
-from backend.main import create_app
+from backend.main import _decode_jpeg_frame, create_app
 from backend.schemas import CivicContext, ReportDraftRequest
 from backend.tools.nyc_311_context import ContextProviderError
 
@@ -37,6 +37,30 @@ class StubLiveModelAdapter:
             confirmation="Adapter confirmation prompt.",
             followup="Adapter follow-up prompt.",
         )
+
+
+def test_decode_jpeg_frame_accepts_valid_data_url() -> None:
+    frame = _decode_jpeg_frame("data:image/jpeg;base64,/9j/AA==")
+
+    assert frame == b"\xff\xd8\xff\x00"
+
+
+def test_decode_jpeg_frame_rejects_invalid_base64() -> None:
+    try:
+        _decode_jpeg_frame("data:image/jpeg;base64,not valid")
+    except ValueError as exc:
+        assert "base64" in str(exc)
+    else:
+        raise AssertionError("Expected invalid base64 to be rejected")
+
+
+def test_decode_jpeg_frame_rejects_non_jpeg_data_url() -> None:
+    try:
+        _decode_jpeg_frame("data:image/png;base64,/9j/AA==")
+    except ValueError as exc:
+        assert "JPEG" in str(exc)
+    else:
+        raise AssertionError("Expected non-JPEG data URL to be rejected")
 
 
 def test_demo_draft_report_returns_story_routing_and_dtpr_chain() -> None:

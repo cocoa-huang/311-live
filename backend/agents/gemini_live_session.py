@@ -22,9 +22,22 @@ EVIDENCE RULES
 - You can hear the resident in real time and may receive camera frames.
 - Separate resident claims from visual observations.
 - Say "I heard you mention..." for speech-only claims.
-- Say "I see..." only when camera frames support the statement.
+- Say "The camera appears to show..." for uncertain visual observations.
+- Say "I see..." only when camera frames clearly support the statement.
 - If visual input is missing, unclear, or does not show the claimed issue, say so.
 - Never pretend to see trash bags, faces, blockage, hazards, or location details.
+
+VISUAL GROUNDING PROTOCOL
+Before relying on visual evidence, decide whether usable frames are available:
+- not_available: no recent camera frame.
+- unclear: frame is too blurry, distant, dark, cropped, or ambiguous.
+- supports_claim: visible contents support the resident's claim.
+- conflicts_with_claim: visible contents appear inconsistent with the claim.
+Describe only visible primitives such as bag-like objects, sidewalk edge,
+curb/roadway, narrowed pedestrian path, or unclear frame. If frames are absent
+or ambiguous, ask the resident to hold steady, pan closer, or verbally confirm.
+If the resident says "just report it," proceed as resident-reported only and
+make the uncertainty explicit.
 
 DEMO CONTEXT
 - Approximate location is geolocked to East 8th Street and Avenue A, East
@@ -35,6 +48,8 @@ it.
 instead of asking for an exact street from scratch.
 
 CONVERSATION POLICY
+Follow this sequence: orient -> visual check -> issue confirmation -> location
+confirmation -> blockage/impact -> recurrence -> brief summary -> tool call.
 1. Acknowledge the resident's issue.
 2. Ask them to show the issue if visual evidence is needed.
 3. Classify and correct gently:
@@ -158,8 +173,35 @@ def _make_report_draft_tool():
                         "visual_evidence_summary": Schema(
                             type="STRING",
                             description=(
-                                "What the camera frames visibly support. If no "
-                                "visual evidence was available or clear, say that."
+                                "What the camera frames visibly support using only "
+                                "grounded observations. If no visual evidence was "
+                                "available or clear, say exactly that and do not "
+                                "infer trash, faces, hazards, or address details."
+                            ),
+                        ),
+                        "visual_status": Schema(
+                            type="STRING",
+                            description=(
+                                "One of not_available, unclear, supports_claim, "
+                                "or conflicts_with_claim."
+                            ),
+                        ),
+                        "location_status": Schema(
+                            type="STRING",
+                            description=(
+                                "One of geolock_accepted, resident_corrected, "
+                                "or unconfirmed."
+                            ),
+                        ),
+                        "readiness_status": Schema(
+                            type="STRING",
+                            description="One of ready or needs_followup.",
+                        ),
+                        "blocked_path": Schema(
+                            type="STRING",
+                            description=(
+                                "One of sidewalk, curb_ramp, crosswalk, bike_lane, "
+                                "street, none, or unknown."
                             ),
                         ),
                         "accessibility_impact": Schema(
@@ -205,8 +247,25 @@ def _make_report_draft_tool():
                                 "visible for human review."
                             ),
                         ),
+                        "missing_required_detail": Schema(
+                            type="STRING",
+                            description=(
+                                "If readiness_status is needs_followup, the one "
+                                "missing detail the agent should ask about next."
+                            ),
+                        ),
                     },
-                    required=["issue_description", "location_description"],
+                    required=[
+                        "issue_description",
+                        "location_description",
+                        "resident_claim_summary",
+                        "visual_evidence_summary",
+                        "visual_status",
+                        "location_status",
+                        "readiness_status",
+                        "slot_quality_summary",
+                        "remaining_uncertainty",
+                    ],
                 ),
             )
         ]

@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import binascii
 import json
 import logging
+import time
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +40,7 @@ from backend.tools.nyc_311_context import CivicContextProvider, provider_from_se
 from backend.tools.report_store import report_store
 
 logger = logging.getLogger("uvicorn.error")
+MAX_IMAGE_FRAME_BYTES = 2_000_000
 
 
 def create_app(
@@ -172,6 +175,28 @@ async def _run_deterministic_session(
         return
 
 
+def _decode_jpeg_frame(raw: str) -> bytes:
+    if not raw:
+        raise ValueError("empty image frame")
+
+    payload = raw
+    if "," in raw:
+        header, payload = raw.split(",", 1)
+        if "image/jpeg" not in header and "image/jpg" not in header:
+            raise ValueError("image frame must be a JPEG data URL")
+
+    try:
+        frame = base64.b64decode(payload, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("invalid image frame base64") from exc
+
+    if len(frame) > MAX_IMAGE_FRAME_BYTES:
+        raise ValueError("image frame exceeds size limit")
+    if not frame.startswith(b"\xff\xd8"):
+        raise ValueError("image frame is not JPEG encoded")
+    return frame
+
+
 async def _run_gemini_live_session(
     websocket: WebSocket,
     settings,
@@ -216,6 +241,11 @@ async def _run_gemini_live_session(
         ctx: dict = {"location_label": None}
         audio_frames = 0
         image_frames = 0
+        dropped_image_frames = 0
+        last_image_at: float | None = None
+        setup_complete = False
+        location_nudge_sent = False
+        visual_nudge_sent = False
         pending_draft_ready: dict | None = None
         await websocket.send_text(
             json.dumps(
@@ -227,8 +257,31 @@ async def _run_gemini_live_session(
         )
         logger.info("gemini-live: session_ready sent to frontend")
 
+        async def _send_location_nudge_if_ready() -> None:
+            nonlocal location_nudge_sent
+            if not setup_complete or location_nudge_sent or not ctx.get("location_label"):
+                return
+            await manager.send_text(
+                "[System state update; do not answer this packet directly. "
+                f"Reporter GPS is approximately {ctx['location_label']}. "
+                "Use it as approximate location context and ask the resident to confirm.]"
+            )
+            location_nudge_sent = True
+
+        async def _send_visual_nudge_if_ready() -> None:
+            nonlocal visual_nudge_sent
+            if visual_nudge_sent or image_frames == 0:
+                return
+            await manager.send_text(
+                "[System state update; do not answer this packet directly. "
+                "A camera frame has been received. Ground visual statements only "
+                "in visible contents. If the frame is unclear, say it is unclear "
+                "and keep resident claims separate from camera evidence.]"
+            )
+            visual_nudge_sent = True
+
         async def _recv_from_frontend() -> None:
-            nonlocal audio_frames, image_frames
+            nonlocal audio_frames, image_frames, dropped_image_frames, last_image_at
             try:
                 while True:
                     msg = await websocket.receive()
@@ -251,16 +304,33 @@ async def _run_gemini_live_session(
                         if msg_type == "text":
                             await manager.send_text(data.get("text", ""))
                         elif msg_type == "image_frame":
+                            raw = data.get("data", "")
+                            try:
+                                jpeg_bytes = _decode_jpeg_frame(raw)
+                            except ValueError as exc:
+                                dropped_image_frames += 1
+                                logger.warning(
+                                    "gemini-live: dropped image frame #%s (%s)",
+                                    dropped_image_frames,
+                                    exc,
+                                )
+                                continue
+
                             image_frames += 1
+                            last_image_at = time.monotonic()
+                            width = data.get("width")
+                            height = data.get("height")
                             if image_frames == 1 or image_frames % 5 == 0:
                                 logger.info(
-                                    "gemini-live: received image frame #%s",
+                                    "gemini-live: received image frame #%s (%s bytes, %sx%s)",
                                     image_frames,
+                                    len(jpeg_bytes),
+                                    width or "?",
+                                    height or "?",
                                 )
-                            raw = data.get("data", "")
-                            if "," in raw:
-                                raw = raw.split(",", 1)[1]
-                            await manager.send_image(base64.b64decode(raw))
+                            await manager.send_image(jpeg_bytes)
+                            if image_frames == 1:
+                                await _send_visual_nudge_if_ready()
                         elif msg_type == "start":
                             loc = (data.get("payload") or {}).get("location") or {}
                             lat = loc.get("latitude")
@@ -270,11 +340,12 @@ async def _run_gemini_live_session(
                                     f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, "
                                     f"{abs(lng):.4f}°{'E' if lng >= 0 else 'W'}"
                                 )
+                                await _send_location_nudge_if_ready()
             except (WebSocketDisconnect, RuntimeError):
                 pass
 
         async def _recv_from_gemini() -> None:
-            nonlocal pending_draft_ready
+            nonlocal pending_draft_ready, setup_complete
             try:
                 while True:
                     received_any = False
@@ -282,12 +353,8 @@ async def _run_gemini_live_session(
                         received_any = True
                         if isinstance(event, SetupCompleteEvent):
                             logger.info("gemini-live: setup_complete received")
-                            await asyncio.sleep(0.15)
-                            if ctx.get("location_label"):
-                                await manager.send_text(
-                                    f"[System: Reporter GPS is approximately {ctx['location_label']}. "
-                                    f"Reference this when discussing location.]"
-                                )
+                            setup_complete = True
+                            await _send_location_nudge_if_ready()
                         elif isinstance(event, AudioChunkEvent):
                             logger.info(
                                 "gemini-live: sending audio chunk (%s bytes)",
@@ -332,6 +399,69 @@ async def _run_gemini_live_session(
                                 remaining_uncertainty = args.get(
                                     "remaining_uncertainty", ""
                                 )
+                                visual_status = args.get("visual_status", "")
+                                readiness_status = args.get("readiness_status", "")
+                                missing_detail = args.get("missing_required_detail", "")
+                                image_age = (
+                                    time.monotonic() - last_image_at
+                                    if last_image_at is not None
+                                    else None
+                                )
+                                logger.info(
+                                    "gemini-live: draft tool state images=%s dropped=%s age=%s visual_status=%r readiness=%r",
+                                    image_frames,
+                                    dropped_image_frames,
+                                    f"{image_age:.2f}s" if image_age is not None else "none",
+                                    visual_status,
+                                    readiness_status,
+                                )
+                                missing_fields = [
+                                    field
+                                    for field, value in {
+                                        "issue_description": issue_desc,
+                                        "location_description": loc_desc,
+                                        "resident_claim_summary": resident_claim,
+                                        "visual_evidence_summary": visual_evidence,
+                                        "slot_quality_summary": slot_quality,
+                                    }.items()
+                                    if not str(value or "").strip()
+                                ]
+                                if readiness_status == "needs_followup" or missing_fields:
+                                    await manager.respond_to_tool_call(
+                                        event.call_id,
+                                        event.name,
+                                        {
+                                            "status": "needs_followup",
+                                            "missing_fields": missing_fields
+                                            or [missing_detail or "required intake detail"],
+                                            "message": (
+                                                "Ask one concrete follow-up, then call "
+                                                "create_report_draft only when the intake "
+                                                "slots are ready."
+                                            ),
+                                        },
+                                    )
+                                    logger.info(
+                                        "gemini-live: rejected premature draft tool call"
+                                    )
+                                    continue
+                                if visual_status == "supports_claim" and image_frames == 0:
+                                    await manager.respond_to_tool_call(
+                                        event.call_id,
+                                        event.name,
+                                        {
+                                            "status": "needs_correction",
+                                            "message": (
+                                                "No camera frames reached the backend. "
+                                                "Downgrade visual_status and separate "
+                                                "resident claims from visual evidence."
+                                            ),
+                                        },
+                                    )
+                                    logger.info(
+                                        "gemini-live: rejected visually unsupported draft tool call"
+                                    )
+                                    continue
                                 scenario, demo_variant = infer_live_report_path(issue_desc)
                                 transcript_parts = [
                                     issue_desc,
@@ -361,7 +491,25 @@ async def _run_gemini_live_session(
                                     recurrence=recurrence or None,
                                     recommended_category=recommended_category or None,
                                     recommended_agency=recommended_agency or None,
-                                    slot_quality_summary=slot_quality or None,
+                                    slot_quality_summary=(
+                                        "; ".join(
+                                            part
+                                            for part in [
+                                                slot_quality,
+                                                f"visual_status={visual_status}"
+                                                if visual_status
+                                                else "",
+                                                f"location_status={args.get('location_status', '')}"
+                                                if args.get("location_status")
+                                                else "",
+                                                f"blocked_path={args.get('blocked_path', '')}"
+                                                if args.get("blocked_path")
+                                                else "",
+                                            ]
+                                            if part
+                                        )
+                                        or None
+                                    ),
                                     remaining_uncertainty=remaining_uncertainty or None,
                                 )
                                 draft = build_report_draft(request, context_provider)
