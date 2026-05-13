@@ -22,6 +22,10 @@ async function proxy(request: NextRequest, context: RouteContext) {
   if (contentType) {
     headers.set("content-type", contentType);
   }
+  const liveAccessCode = request.headers.get("x-live-access-code");
+  if (liveAccessCode) {
+    headers.set("x-live-access-code", liveAccessCode);
+  }
 
   const hasBody = request.method !== "GET" && request.method !== "HEAD";
   const response = await fetch(targetUrl, {

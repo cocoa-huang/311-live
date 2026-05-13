@@ -7,6 +7,7 @@ from backend.main import (
     create_app,
 )
 from backend.schemas import CivicContext, IntakeState, ReportDraftRequest
+from backend.settings import get_settings
 from backend.tools.nyc_311_context import ContextProviderError
 
 
@@ -42,6 +43,7 @@ class StubLiveModelAdapter:
             followup="Adapter follow-up prompt.",
             intake_state=IntakeState(
                 frame_status="available",
+                camera_lifecycle="evidence_captured",
                 candidate_provenance="camera_observed",
             ),
         )
@@ -413,6 +415,10 @@ def test_live_websocket_detects_candidate_and_requires_location_confirmation() -
         websocket.send_json({"type": "start", "payload": {}})
         started = websocket.receive_json()
         assert started["type"] == "session_started"
+        assert (
+            started["payload"]["intake_state"]["camera_lifecycle"]
+            == "camera_streaming"
+        )
 
         websocket.send_json(
             {
@@ -448,6 +454,23 @@ def test_live_websocket_detects_candidate_and_requires_location_confirmation() -
         websocket.send_json({"type": "create_draft", "payload": {}})
         blocked = websocket.receive_json()
         assert blocked["type"] == "location_confirmation_required"
+
+
+def test_live_websocket_can_close_camera_and_continue_session() -> None:
+    client = TestClient(create_app())
+
+    with client.websocket_connect("/ws/live") as websocket:
+        websocket.send_json({"type": "start", "payload": {}})
+        websocket.receive_json()
+
+        websocket.send_json({"type": "camera_closed", "payload": {}})
+        camera_closed = websocket.receive_json()
+
+        assert camera_closed["type"] == "camera_closed"
+        assert (
+            camera_closed["payload"]["intake_state"]["camera_lifecycle"]
+            == "camera_closed_by_user"
+        )
 
 
 def test_live_websocket_creates_reviewable_draft_after_location_confirmation() -> None:
@@ -542,6 +565,42 @@ def test_live_classify_endpoint_uses_injected_model_adapter() -> None:
     assert payload["candidate"] == "Adapter-selected trash report"
     assert payload["model_source"] == "deterministic"
     assert payload["intake_state"]["candidate_provenance"] == "camera_observed"
+    assert payload["intake_state"]["camera_lifecycle"] == "evidence_captured"
+
+
+def test_live_classify_requires_access_code_when_live_ai_is_protected(monkeypatch) -> None:
+    monkeypatch.setenv("LIVE_MODEL_MODE", "vertex")
+    monkeypatch.setenv("LIVE_ACCESS_CODE", "demo-pass")
+    get_settings.cache_clear()
+    client = TestClient(create_app(live_model_adapter=StubLiveModelAdapter()))
+
+    response = client.post(
+        "/api/live/classify",
+        json={"transcript": "custom adapter should classify this"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Live AI access code required"
+    get_settings.cache_clear()
+
+
+def test_live_classify_accepts_valid_access_code_when_live_ai_is_protected(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LIVE_MODEL_MODE", "vertex")
+    monkeypatch.setenv("LIVE_ACCESS_CODE", "demo-pass")
+    get_settings.cache_clear()
+    client = TestClient(create_app(live_model_adapter=StubLiveModelAdapter()))
+
+    response = client.post(
+        "/api/live/classify",
+        headers={"x-live-access-code": "demo-pass"},
+        json={"transcript": "custom adapter should classify this"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["candidate"] == "Adapter-selected trash report"
+    get_settings.cache_clear()
 
 
 def test_confirm_report_returns_404_for_unknown_report() -> None:

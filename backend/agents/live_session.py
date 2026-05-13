@@ -16,6 +16,7 @@ from backend.tools.nyc_311_context import CivicContextProvider
 
 LiveEventType = Literal[
     "session_started",
+    "camera_closed",
     "candidate_detected",
     "followup_required",
     "location_confirmation_required",
@@ -63,6 +64,9 @@ class LiveSession:
 
     def start(self, payload: dict[str, Any]) -> LiveEvent:
         self.location = _location_from_payload(payload.get("location"))
+        self.intake_state = self.intake_state.model_copy(
+            update={"camera_lifecycle": "camera_streaming"}
+        )
         if self.location and self.location.confirmed:
             self.location_confirmed = True
             self.intake_state = self.intake_state.model_copy(
@@ -99,7 +103,14 @@ class LiveSession:
         self.scenario = candidate.scenario
         self.demo_variant = candidate.demo_variant
         self.intake_state = candidate.intake_state.model_copy(
-            update={"location_confirmed": self.location_confirmed}
+            update={
+                "location_confirmed": self.location_confirmed,
+                "camera_lifecycle": (
+                    "evidence_captured"
+                    if candidate.intake_state.frame_status == "available"
+                    else self.intake_state.camera_lifecycle
+                ),
+            }
         )
         return self._event(
             "candidate_detected",
@@ -131,6 +142,16 @@ class LiveSession:
                 "location": self.location.model_dump() if self.location else None,
                 "intake_state": self.intake_state.model_dump(mode="json"),
             },
+        )
+
+    def close_camera(self) -> LiveEvent:
+        self.intake_state = self.intake_state.model_copy(
+            update={"camera_lifecycle": "camera_closed_by_user"}
+        )
+        return self._event(
+            "camera_closed",
+            "Camera capture stopped. Continue by voice only.",
+            {"intake_state": self.intake_state.model_dump(mode="json")},
         )
 
     def confirm_location(self, payload: dict[str, Any]) -> LiveEvent:

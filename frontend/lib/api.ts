@@ -46,6 +46,11 @@ export interface CivicContext {
 
 export interface IntakeState {
   frame_status: "not_available" | "available" | "not_required";
+  camera_lifecycle:
+    | "unavailable"
+    | "camera_streaming"
+    | "evidence_captured"
+    | "camera_closed_by_user";
   candidate_provenance:
     | "camera_observed"
     | "resident_reported_only"
@@ -150,14 +155,31 @@ const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 const WS_BASE_URL =
   process.env.NEXT_PUBLIC_WS_BASE_URL ?? "";
+const LIVE_ACCESS_CODE_STORAGE_KEY = "311-live-access-code";
 
 function apiUrl(path: string) {
   return API_BASE_URL ? `${API_BASE_URL}${path}` : `/api/backend${path}`;
 }
 
-export function liveWebSocketUrl() {
+export function getStoredLiveAccessCode() {
+  if (typeof window === "undefined") return "";
+  return window.sessionStorage.getItem(LIVE_ACCESS_CODE_STORAGE_KEY) ?? "";
+}
+
+export function storeLiveAccessCode(code: string) {
+  if (typeof window === "undefined") return;
+  const trimmed = code.trim();
+  if (trimmed) {
+    window.sessionStorage.setItem(LIVE_ACCESS_CODE_STORAGE_KEY, trimmed);
+  } else {
+    window.sessionStorage.removeItem(LIVE_ACCESS_CODE_STORAGE_KEY);
+  }
+}
+
+export function liveWebSocketUrl(accessCode = getStoredLiveAccessCode()) {
   if (WS_BASE_URL) {
-    return `${WS_BASE_URL}/ws/live`;
+    const suffix = accessCode ? `?access_code=${encodeURIComponent(accessCode)}` : "";
+    return `${WS_BASE_URL}/ws/live${suffix}`;
   }
   return null;
 }
@@ -195,10 +217,14 @@ export async function classifyLiveObservation(
   imageSummary?: string,
   imageFrame?: string,
   location?: Location,
+  accessCode = getStoredLiveAccessCode(),
 ): Promise<LiveClassifyResponse> {
   const response = await fetch(apiUrl("/api/live/classify"), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessCode ? { "x-live-access-code": accessCode } : {}),
+    },
     body: JSON.stringify({
       transcript,
       image_summary: imageSummary,

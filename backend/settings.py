@@ -49,6 +49,9 @@ class Settings(BaseModel):
     gemini_api_key: str | None = Field(
         default_factory=lambda: getenv("GEMINI_API_KEY") or None
     )
+    live_access_code: str | None = Field(
+        default_factory=lambda: getenv("LIVE_ACCESS_CODE") or None
+    )
 
 
 @lru_cache

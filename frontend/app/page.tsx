@@ -18,7 +18,9 @@ import {
   classifyLiveObservation,
   confirmDraft,
   createDemoDraft,
+  getStoredLiveAccessCode,
   liveWebSocketUrl,
+  storeLiveAccessCode,
   updateDraft,
   type DemoVariant,
   type ReportScenario,
@@ -82,6 +84,7 @@ interface CapturedCameraFrame {
 interface LiveAgentEvent {
   type:
     | "session_started"
+    | "camera_closed"
     | "candidate_detected"
     | "followup_required"
     | "location_confirmation_required"
@@ -180,6 +183,7 @@ export default function CitizenApp() {
   const audioInWorkletRef = useRef<AudioWorkletNode | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
   const playbackCursorRef = useRef<number>(0);
+  const draftTransitionTimeoutRef = useRef<number | null>(null);
   const cameraFrameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const subtitleQueueRef = useRef<string[]>([]);
   const subtitleTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -209,12 +213,14 @@ export default function CitizenApp() {
   const [userSpeaking, setUserSpeaking] = useState<string>("");
   const [cameraFramesSent, setCameraFramesSent] = useState(0);
   const [intakeState, setIntakeState] = useState<IntakeState | null>(null);
+  const [liveAccessCode, setLiveAccessCode] = useState("");
 
   const geminiLiveMode = !!liveWebSocketUrl();
   const activeVariant = detectedVariant ?? inferIssueVariant(issueDescription);
 
   useEffect(() => {
     setMounted(true);
+    setLiveAccessCode(getStoredLiveAccessCode());
   }, []);
 
   useEffect(() => {
@@ -224,6 +230,10 @@ export default function CitizenApp() {
   }, [phase]);
 
   const stopLiveInputs = useCallback(() => {
+    if (draftTransitionTimeoutRef.current !== null) {
+      window.clearTimeout(draftTransitionTimeoutRef.current);
+      draftTransitionTimeoutRef.current = null;
+    }
     recognitionRef.current?.stop();
     recognitionRef.current = null;
     liveSocketRef.current?.close();
@@ -253,6 +263,33 @@ export default function CitizenApp() {
     setCameraFramesSent(0);
     setIntakeState(null);
   }, []);
+
+  function scheduleDraftTransition(report: ReportDraft, nextIntakeState?: IntakeState) {
+    const playbackContext = playbackContextRef.current;
+    const remainingPlaybackSeconds = playbackContext
+      ? Math.max(0, playbackCursorRef.current - playbackContext.currentTime)
+      : 0;
+    const transitionDelayMs = Math.ceil((remainingPlaybackSeconds + 0.35) * 1000);
+
+    if (draftTransitionTimeoutRef.current !== null) {
+      window.clearTimeout(draftTransitionTimeoutRef.current);
+    }
+
+    setIntakeState(nextIntakeState ?? null);
+    setDraft(report);
+    setLoading(false);
+    setLiveAgentMessage(
+      remainingPlaybackSeconds > 0.1
+        ? "Finishing Gemini's spoken summary before opening the report."
+        : null,
+    );
+
+    draftTransitionTimeoutRef.current = window.setTimeout(() => {
+      draftTransitionTimeoutRef.current = null;
+      setPhase("draft");
+      stopLiveInputs();
+    }, transitionDelayMs);
+  }
 
   useEffect(() => {
     return () => {
@@ -404,7 +441,7 @@ export default function CitizenApp() {
   }
 
   function connectLiveAgent() {
-    const url = liveWebSocketUrl();
+    const url = liveWebSocketUrl(liveAccessCode);
     if (!url) {
       setLiveAgentStatus("fallback");
       return;
@@ -465,6 +502,9 @@ export default function CitizenApp() {
       } else if (eventType === "intake_state_updated") {
         const payload = data.payload as LiveAgentEvent["payload"];
         setIntakeState(payload?.intake_state ?? null);
+      } else if (eventType === "camera_closed") {
+        const payload = data.payload as LiveAgentEvent["payload"];
+        setIntakeState(payload?.intake_state ?? null);
       } else if (eventType === "draft_ready") {
         const payload = data.payload as {
           report?: ReportDraft;
@@ -472,11 +512,7 @@ export default function CitizenApp() {
           intake_state?: IntakeState;
         };
         if (payload?.report) {
-          setIntakeState(payload.intake_state ?? null);
-          setDraft(payload.report);
-          setPhase("draft");
-          setLoading(false);
-          stopLiveInputs();
+          scheduleDraftTransition(payload.report, payload.intake_state);
         }
       // Legacy deterministic events
       } else if (eventType === "session_started") {
@@ -659,6 +695,28 @@ export default function CitizenApp() {
     cameraFrameIntervalRef.current = setInterval(sendCameraFrame, 1000);
   }
 
+  function continueByVoiceOnly() {
+    if (cameraFrameIntervalRef.current !== null) {
+      clearInterval(cameraFrameIntervalRef.current);
+      cameraFrameIntervalRef.current = null;
+    }
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setCameraStatus("idle");
+    setLiveAgentMessage("Visual context captured. Keep speaking; camera is off.");
+    setIntakeState((current) =>
+      current
+        ? { ...current, camera_lifecycle: "camera_closed_by_user" }
+        : current,
+    );
+    if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
+      liveSocketRef.current.send(JSON.stringify({ type: "camera_closed", payload: {} }));
+    }
+  }
+
   function playAudioChunk(buffer: ArrayBuffer) {
     const ctx = playbackContextRef.current;
     if (!ctx) return;
@@ -816,6 +874,7 @@ export default function CitizenApp() {
           : undefined,
         imageFrame?.dataUrl,
         currentLocationPayload(false),
+        liveAccessCode,
       );
       const nextVariant = demoVariants.find(
         (variant) => variant.id === classified.demo_variant,
@@ -992,6 +1051,11 @@ export default function CitizenApp() {
     setIntakeState(null);
   }
 
+  function handleLiveAccessCodeChange(value: string) {
+    setLiveAccessCode(value);
+    storeLiveAccessCode(value);
+  }
+
   // Derived step index for the workflow tracker
   const activeStep =
     phase === "ready" || phase === "permissions" ? 0
@@ -999,6 +1063,21 @@ export default function CitizenApp() {
     : phase === "candidate" || phase === "followup" ? 2
     : phase === "draft" ? 3
     : 4;
+
+  const liveProgress =
+    phase === "ready" || phase === "permissions"
+      ? { step: 1, label: "Getting capture ready" }
+      : intakeState?.draft_ready
+        ? { step: 4, label: "Preparing the report" }
+        : intakeState?.location_confirmed
+          ? { step: 3, label: "Checking impact" }
+          : intakeState?.resident_confirmed_intent
+            ? { step: 2, label: "Confirming location" }
+            : phase === "candidate"
+              ? { step: 2, label: "Confirming the issue" }
+              : phase === "followup"
+                ? { step: 3, label: "Checking impact" }
+                : { step: 1, label: "Understanding the issue" };
 
   return (
     <main className="min-h-screen bg-field font-sans">
@@ -1111,6 +1190,21 @@ export default function CitizenApp() {
                 />
               </div>
               <div className="space-y-3 border-t border-ink/8 px-4 pb-4 pt-3">
+                {geminiLiveMode && (
+                  <label className="block">
+                    <span className="mb-1.5 block text-[10px] font-black uppercase tracking-[0.2em] text-ink/45">
+                      Live AI access code
+                    </span>
+                    <input
+                      type="password"
+                      value={liveAccessCode}
+                      onChange={(event) => handleLiveAccessCodeChange(event.target.value)}
+                      placeholder="Enter demo code"
+                      className="focus-ring h-11 w-full border border-ink/15 bg-field px-3 text-sm font-bold text-ink placeholder:text-ink/30"
+                      autoComplete="one-time-code"
+                    />
+                  </label>
+                )}
                 <button
                   type="button"
                   onClick={startReport}
@@ -1218,6 +1312,15 @@ export default function CitizenApp() {
                         ? "Describe what you see"
                         : activeVariant.candidate}
                   </h2>
+                </div>
+
+                <div className="flex items-center justify-between gap-3 border-t border-ink/8 bg-field px-4 py-2.5 text-[11px] font-black uppercase tracking-[0.18em] text-ink/55">
+                  <span>
+                    Step {liveProgress.step} of 4
+                  </span>
+                  <span className="truncate text-right text-ink">
+                    {liveProgress.label}
+                  </span>
                 </div>
 
                 {/* Camera view */}
@@ -1348,6 +1451,15 @@ export default function CitizenApp() {
                         ? "Location confirmed"
                         : "Location pending"}
                     </span>
+                    <span className="inline-flex items-center gap-1.5 bg-ink/6 px-2.5 py-1 text-[11px] font-bold text-ink/55">
+                      {intakeState.camera_lifecycle === "camera_closed_by_user"
+                        ? "Camera off · voice only"
+                        : intakeState.camera_lifecycle === "evidence_captured"
+                          ? "Visual context captured"
+                          : intakeState.camera_lifecycle === "camera_streaming"
+                            ? "Camera streaming"
+                            : "Camera unavailable"}
+                    </span>
                   </div>
                 )}
 
@@ -1397,6 +1509,17 @@ export default function CitizenApp() {
                       </div>
                     </div>
                   </div>
+
+                  {intakeState?.camera_lifecycle === "evidence_captured" &&
+                    cameraStatus === "active" && (
+                      <button
+                        type="button"
+                        onClick={continueByVoiceOnly}
+                        className="focus-ring flex min-h-11 w-full items-center justify-center border border-ink/15 bg-white px-4 py-2.5 text-sm font-black text-ink transition hover:border-ink/35 hover:bg-field"
+                      >
+                        Continue by voice only
+                      </button>
+                    )}
 
                   {/* Resident description input */}
                   {(phase === "observing" ||

@@ -4,8 +4,9 @@ import binascii
 import json
 import logging
 import time
+from hmac import compare_digest
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.agents.gemini_live_session import (
@@ -42,6 +43,7 @@ from backend.tools.report_store import report_store
 
 logger = logging.getLogger("uvicorn.error")
 MAX_IMAGE_FRAME_BYTES = 2_000_000
+LIVE_ACCESS_HEADER = "x-live-access-code"
 
 
 def _looks_like_corrupted_transcript(value: str) -> bool:
@@ -62,6 +64,22 @@ def _looks_like_corrupted_transcript(value: str) -> bool:
     if symbolic >= 1 and digits >= 1 and len(alpha_words) <= 1:
         return True
     return False
+
+
+def _live_access_required(settings) -> bool:
+    return bool(settings.live_access_code) and settings.live_model_mode in {
+        "vertex",
+        "gemini",
+        "gemini-live",
+    }
+
+
+def _live_access_allowed(settings, provided_code: str | None) -> bool:
+    if not _live_access_required(settings):
+        return True
+    if not provided_code or not settings.live_access_code:
+        return False
+    return compare_digest(provided_code, settings.live_access_code)
 
 
 def create_app(
@@ -133,7 +151,10 @@ def create_app(
     @app.post("/api/live/classify", response_model=LiveClassifyResponse)
     async def classify_live_observation(
         request: LiveClassifyRequest,
+        live_access_code: str | None = Header(default=None, alias=LIVE_ACCESS_HEADER),
     ) -> LiveClassifyResponse:
+        if not _live_access_allowed(settings, live_access_code):
+            raise HTTPException(status_code=401, detail="Live AI access code required")
         candidate = await resolved_live_model_adapter.detect_candidate(
             LiveObservation(
                 transcript=request.transcript,
@@ -154,6 +175,10 @@ def create_app(
 
     @app.websocket("/ws/live")
     async def live_agent(websocket: WebSocket) -> None:
+        provided_code = websocket.query_params.get("access_code")
+        if not _live_access_allowed(settings, provided_code):
+            await websocket.close(code=1008, reason="Live AI access code required")
+            return
         await websocket.accept()
         if settings.live_model_mode in {"vertex", "gemini", "gemini-live"}:
             await _run_gemini_live_session(
@@ -184,6 +209,8 @@ async def _run_deterministic_session(
                 event = await session.observe(payload)
             elif message_type == "intent_confirmed":
                 event = session.confirm_intent()
+            elif message_type == "camera_closed":
+                event = session.close_camera()
             elif message_type == "location_confirmed":
                 event = session.confirm_location(payload)
             elif message_type == "create_draft":
@@ -262,7 +289,7 @@ async def _run_gemini_live_session(
         logger.info("gemini-live: Gemini session context opened")
         ctx: dict = {
             "location_label": None,
-            "intake_state": IntakeState(),
+            "intake_state": IntakeState(camera_lifecycle="camera_streaming"),
         }
         audio_frames = 0
         image_frames = 0
@@ -272,6 +299,9 @@ async def _run_gemini_live_session(
         location_nudge_sent = False
         visual_nudge_sent = False
         pending_draft_ready: dict | None = None
+        pending_draft_ready_timeout: asyncio.Task[None] | None = None
+        waiting_for_post_tool_summary = False
+        saw_post_tool_model_output = False
         await websocket.send_text(
             json.dumps(
                 {
@@ -328,6 +358,32 @@ async def _run_gemini_live_session(
                         logger.info("gemini-live: received frontend event %s", msg_type)
                         if msg_type == "text":
                             await manager.send_text(data.get("text", ""))
+                        elif msg_type == "camera_closed":
+                            ctx["intake_state"] = ctx["intake_state"].model_copy(
+                                update={"camera_lifecycle": "camera_closed_by_user"}
+                            )
+                            await manager.send_text(
+                                "[System context update; do not answer this packet "
+                                "directly. The resident intentionally stopped camera "
+                                "capture after the live intake session began. Continue "
+                                "the conversation by voice only. Reuse any visual "
+                                "evidence already collected, keep it distinct from new "
+                                "resident speech, and do not ask to reopen the camera "
+                                "unless one missing report-critical detail truly "
+                                "requires new visual confirmation.]"
+                            )
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "camera_closed",
+                                        "payload": {
+                                            "intake_state": ctx[
+                                                "intake_state"
+                                            ].model_dump(mode="json")
+                                        },
+                                    }
+                                )
+                            )
                         elif msg_type == "image_frame":
                             raw = data.get("data", "")
                             try:
@@ -358,6 +414,7 @@ async def _run_gemini_live_session(
                                 ctx["intake_state"] = ctx["intake_state"].model_copy(
                                     update={
                                         "frame_status": "available",
+                                        "camera_lifecycle": "evidence_captured",
                                         "candidate_provenance": "visual_unclear",
                                     }
                                 )
@@ -388,7 +445,27 @@ async def _run_gemini_live_session(
                 pass
 
         async def _recv_from_gemini() -> None:
-            nonlocal pending_draft_ready, setup_complete
+            nonlocal pending_draft_ready, pending_draft_ready_timeout
+            nonlocal setup_complete, waiting_for_post_tool_summary
+            nonlocal saw_post_tool_model_output
+
+            async def _send_pending_draft_ready_after_timeout() -> None:
+                nonlocal pending_draft_ready, pending_draft_ready_timeout
+                nonlocal waiting_for_post_tool_summary, saw_post_tool_model_output
+
+                try:
+                    await asyncio.sleep(6.0)
+                    if not pending_draft_ready:
+                        return
+                    await websocket.send_text(json.dumps(pending_draft_ready))
+                    logger.info(
+                        "gemini-live: draft_ready sent to frontend after post-tool timeout"
+                    )
+                    pending_draft_ready = None
+                    waiting_for_post_tool_summary = False
+                    saw_post_tool_model_output = False
+                finally:
+                    pending_draft_ready_timeout = None
             try:
                 while True:
                     received_any = False
@@ -399,12 +476,20 @@ async def _run_gemini_live_session(
                             setup_complete = True
                             await _send_location_nudge_if_ready()
                         elif isinstance(event, AudioChunkEvent):
+                            if pending_draft_ready and waiting_for_post_tool_summary:
+                                saw_post_tool_model_output = True
                             logger.info(
                                 "gemini-live: sending audio chunk (%s bytes)",
                                 len(event.data),
                             )
                             await websocket.send_bytes(event.data)
                         elif isinstance(event, TranscriptEvent):
+                            if (
+                                pending_draft_ready
+                                and waiting_for_post_tool_summary
+                                and event.role == "model"
+                            ):
+                                saw_post_tool_model_output = True
                             logger.info(
                                 "gemini-live: transcript role=%s finished=%s text=%r",
                                 event.role,
@@ -665,17 +750,38 @@ async def _run_gemini_live_session(
                                         ].model_dump(mode="json"),
                                     },
                                 }
+                                waiting_for_post_tool_summary = True
+                                saw_post_tool_model_output = False
+                                if pending_draft_ready_timeout:
+                                    pending_draft_ready_timeout.cancel()
+                                pending_draft_ready_timeout = asyncio.create_task(
+                                    _send_pending_draft_ready_after_timeout()
+                                )
                                 logger.info(
-                                    "gemini-live: draft_ready queued until turn_complete"
+                                    "gemini-live: draft_ready queued until post-tool summary completes"
                                 )
                         elif isinstance(event, TurnCompleteEvent):
                             logger.info("gemini-live: turn_complete")
                             await websocket.send_text(json.dumps({"type": "turn_complete"}))
                             if pending_draft_ready:
-                                await asyncio.sleep(2.0)
+                                if (
+                                    waiting_for_post_tool_summary
+                                    and not saw_post_tool_model_output
+                                ):
+                                    logger.info(
+                                        "gemini-live: ignoring pre-summary turn_complete after tool response"
+                                    )
+                                    continue
                                 await websocket.send_text(json.dumps(pending_draft_ready))
-                                logger.info("gemini-live: draft_ready sent to frontend")
+                                logger.info(
+                                    "gemini-live: draft_ready sent to frontend after summary turn_complete"
+                                )
                                 pending_draft_ready = None
+                                waiting_for_post_tool_summary = False
+                                saw_post_tool_model_output = False
+                                if pending_draft_ready_timeout:
+                                    pending_draft_ready_timeout.cancel()
+                                    pending_draft_ready_timeout = None
                     if received_any:
                         logger.info("gemini-live: receive stream ended; waiting for next turn")
                     await asyncio.sleep(0.05)
@@ -692,6 +798,12 @@ async def _run_gemini_live_session(
             task.cancel()
             try:
                 await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if pending_draft_ready_timeout:
+            pending_draft_ready_timeout.cancel()
+            try:
+                await pending_draft_ready_timeout
             except (asyncio.CancelledError, Exception):
                 pass
     finally:

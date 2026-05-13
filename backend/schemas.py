@@ -67,6 +67,12 @@ class CivicContext(BaseModel):
 
 class IntakeState(BaseModel):
     frame_status: Literal["not_available", "available", "not_required"] = "not_available"
+    camera_lifecycle: Literal[
+        "unavailable",
+        "camera_streaming",
+        "evidence_captured",
+        "camera_closed_by_user",
+    ] = "unavailable"
     candidate_provenance: Literal[
         "camera_observed",
         "resident_reported_only",
