@@ -157,6 +157,74 @@ DEFAULT_VARIANT_BY_SCENARIO = {
 }
 
 
+def _clean_phrase(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value.replace("_", " ").strip()
+
+
+def _passage_phrase(value: str | None) -> str | None:
+    mapping = {
+        "fully_blocked": "fully blocking passage",
+        "partially_blocked": "partially blocking passage",
+        "narrowed_but_passable": "narrowing the path while still leaving some room to pass",
+        "passable": "still leaving the path passable",
+        "unknown_after_asking": "with passability still unclear after follow-up",
+    }
+    return mapping.get(value or "")
+
+
+def _urgency_phrase(value: str | None) -> str | None:
+    mapping = {
+        "immediate_safety_risk": "creating an immediate safety or access concern",
+        "mobility_disruption": "disrupting normal mobility or access",
+        "non_urgent": "without a reported immediate safety risk",
+        "unknown_after_asking": "with urgency still unclear after follow-up",
+    }
+    return mapping.get(value or "")
+
+
+def _draft_visible_text(
+    request: ReportDraftRequest,
+    variant: dict,
+) -> tuple[str, str]:
+    base_description = str(variant["description"])
+    base_narrative = str(variant["narrative"])
+    path = _clean_phrase(request.blocked_path)
+    passage = _passage_phrase(request.passage_status)
+    urgency = _urgency_phrase(request.urgency_signal)
+    accessibility = request.accessibility_impact
+    recurrence = request.recurrence
+
+    description_details = [detail for detail in [path, passage] if detail]
+    if accessibility:
+        description_details.append(accessibility.rstrip("."))
+    if urgency:
+        description_details.append(urgency)
+    if recurrence:
+        description_details.append(f"Reported as {recurrence.rstrip('.')}")
+
+    if not description_details:
+        return base_description, base_narrative
+
+    description = base_description.rstrip(".")
+    description += f". Follow-up clarified: {'; '.join(description_details)}."
+
+    narrative_parts = [base_narrative.rstrip(".")]
+    if path or passage:
+        path_text = f"the {path}" if path else "the affected path"
+        passage_text = passage or "the degree of blockage was discussed"
+        narrative_parts.append(f"The resident clarified that {path_text} is involved and the condition is {passage_text}.")
+    if accessibility:
+        narrative_parts.append(f"Reported impact: {accessibility.rstrip('.')}.")
+    if urgency:
+        narrative_parts.append(f"The intake also records this as {urgency}.")
+    if recurrence:
+        narrative_parts.append(f"Recurrence or duration: {recurrence.rstrip('.')}.")
+
+    return description, " ".join(narrative_parts)
+
+
 def build_report_draft(
     request: ReportDraftRequest,
     context_provider: CivicContextProvider | None = None,
@@ -173,11 +241,19 @@ def build_report_draft(
 
     category = str(variant.get("category", "street_flooding"))
     subcategory = str(variant.get("subcategory", "near_school_crossing"))
-    title = str(variant.get("title", "Flooding blocking a school crossing"))
+    raw_title = request.issue_description
+    if raw_title and raw_title.strip():
+        cleaned = raw_title.strip().rstrip(".")
+        title = cleaned[0].upper() + cleaned[1:]
+    else:
+        title = str(variant.get("title", "Flooding blocking a school crossing"))
     service_context = str(
         variant.get("service_context", "Street flooding near a school crossing")
     )
     priority = variant.get("priority", Priority.HIGH)
+    # Escalate to HIGH when issue is near school/transit and impacts a specific group.
+    if request.near_school_or_transit and request.special_population_impact:
+        priority = Priority.HIGH
     transcript = request.transcript or str(variant["transcript"])
     image_summary = (
         request.visual_evidence_summary
@@ -195,6 +271,7 @@ def build_report_draft(
             f"Open Data context unavailable: {exc}", variant_scenario
         )
     location_confirmed = location.confirmed
+    description, narrative = _draft_visible_text(request, variant)
 
     return ReportDraft(
         id=f"draft_{uuid4().hex[:10]}",
@@ -202,8 +279,8 @@ def build_report_draft(
         category=category,
         subcategory=subcategory,
         title=title,
-        description=str(variant["description"]),
-        narrative=str(variant["narrative"]),
+        description=description,
+        narrative=narrative,
         location=location,
         observed_at=datetime.now(timezone.utc),
         priority=priority,
@@ -287,6 +364,19 @@ def build_report_draft(
                 if request.slot_quality_summary
                 else []
             ),
+            *(
+                [
+                    InferredContext(
+                        label="Candidate provenance",
+                        value=request.candidate_provenance.replace("_", " "),
+                        confidence=0.88
+                        if request.candidate_provenance == "camera_observed"
+                        else 0.64,
+                    )
+                ]
+                if request.candidate_provenance
+                else []
+            ),
             InferredContext(
                 label="Human impact",
                 value=str(variant["human_impact"]),
@@ -302,6 +392,21 @@ def build_report_draft(
                 label="311 historical context",
                 value=civic_context.evidence_summary,
                 confidence=civic_context.confidence,
+            ),
+            *(
+                [
+                    InferredContext(
+                        label="School or transit proximity",
+                        value=(
+                            f"Near school/transit — {request.special_population_impact}"
+                            if request.special_population_impact
+                            else "Resident confirmed issue is near a school or transit stop"
+                        ),
+                        confidence=0.90,
+                    )
+                ]
+                if request.near_school_or_transit
+                else []
             ),
         ],
         human_review=[
@@ -342,6 +447,36 @@ def build_report_draft(
                     )
                 ]
                 if request.remaining_uncertainty
+                else []
+            ),
+            *(
+                [
+                    HumanReviewField(
+                        field="candidate_provenance",
+                        reason=(
+                            "The candidate issue was not visually established by the "
+                            "backend intake state and should stay explicit in review."
+                        ),
+                        current_value=request.candidate_provenance,
+                    )
+                ]
+                if request.candidate_provenance
+                in {"resident_reported_only", "visual_unclear"}
+                else []
+            ),
+            *(
+                [
+                    HumanReviewField(
+                        field="priority.school_transit_escalation",
+                        reason=(
+                            "Priority was escalated to HIGH because the issue is near a "
+                            "school or transit stop and impacts a specific population group. "
+                            "Confirm this is accurate before submission."
+                        ),
+                        current_value=request.special_population_impact,
+                    )
+                ]
+                if request.near_school_or_transit and request.special_population_impact
                 else []
             ),
         ],

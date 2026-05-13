@@ -1,8 +1,12 @@
 from fastapi.testclient import TestClient
 
 from backend.agents.live_model import LiveCandidate, LiveObservation
-from backend.main import _decode_jpeg_frame, create_app
-from backend.schemas import CivicContext, ReportDraftRequest
+from backend.main import (
+    _decode_jpeg_frame,
+    _looks_like_corrupted_transcript,
+    create_app,
+)
+from backend.schemas import CivicContext, IntakeState, ReportDraftRequest
 from backend.tools.nyc_311_context import ContextProviderError
 
 
@@ -36,6 +40,10 @@ class StubLiveModelAdapter:
             candidate="Adapter-selected trash report",
             confirmation="Adapter confirmation prompt.",
             followup="Adapter follow-up prompt.",
+            intake_state=IntakeState(
+                frame_status="available",
+                candidate_provenance="camera_observed",
+            ),
         )
 
 
@@ -61,6 +69,14 @@ def test_decode_jpeg_frame_rejects_non_jpeg_data_url() -> None:
         assert "JPEG" in str(exc)
     else:
         raise AssertionError("Expected non-JPEG data URL to be rejected")
+
+
+def test_corrupted_transcript_detector_flags_symbolic_gibberish() -> None:
+    assert _looks_like_corrupted_transcript("2x ^ 6Y + 6") is True
+
+
+def test_corrupted_transcript_detector_accepts_short_valid_confirmation() -> None:
+    assert _looks_like_corrupted_transcript("Yes, that's correct.") is False
 
 
 def test_demo_draft_report_returns_story_routing_and_dtpr_chain() -> None:
@@ -194,6 +210,35 @@ def test_demo_draft_supports_street_trash_bags_scenario() -> None:
     assert "sanitation" in payload["uncertainty"][1]["reason"].lower()
     assert payload["civic_context"]["likely_agencies"] == ["NYC DSNY", "NYC311"]
     assert payload["location"]["borough"] == "Manhattan"
+
+
+def test_demo_draft_surfaces_followup_answers_in_visible_text() -> None:
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/report/draft",
+        json={
+            "scenario": "trash_bags_on_street",
+            "demo_variant": "street_trash_bags",
+            "blocked_path": "street",
+            "passage_status": "partially_blocked",
+            "urgency_signal": "immediate_safety_risk",
+            "accessibility_impact": (
+                "Cars are swerving around the bags and pedestrians are stepping "
+                "off the curb."
+            ),
+            "recurrence": "recurring after missed collection days",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "follow-up clarified" in payload["description"].lower()
+    assert "street" in payload["description"].lower()
+    assert "partially blocking passage" in payload["description"].lower()
+    assert "immediate safety or access concern" in payload["description"].lower()
+    assert "cars are swerving" in payload["narrative"].lower()
+    assert "recurring after missed collection days" in payload["narrative"].lower()
 
 
 def test_demo_draft_rejects_mismatched_scenario_and_variant() -> None:
@@ -389,11 +434,16 @@ def test_live_websocket_detects_candidate_and_requires_location_confirmation() -
         assert candidate["type"] == "candidate_detected"
         assert candidate["payload"]["scenario"] == "trash_bags_on_street"
         assert candidate["payload"]["demo_variant"] == "street_trash_bags"
+        assert (
+            candidate["payload"]["intake_state"]["candidate_provenance"]
+            == "resident_reported_only"
+        )
 
         websocket.send_json({"type": "intent_confirmed", "payload": {}})
         followup = websocket.receive_json()
         assert followup["type"] == "followup_required"
         assert followup["payload"]["requires_location_confirmation"] is True
+        assert followup["payload"]["intake_state"]["resident_confirmed_intent"] is True
 
         websocket.send_json({"type": "create_draft", "payload": {}})
         blocked = websocket.receive_json()
@@ -443,6 +493,11 @@ def test_live_websocket_creates_reviewable_draft_after_location_confirmation() -
         assert report["subcategory"] == "near_school_crossing"
         assert report["location"]["confirmed"] is True
         assert report["status"] == "draft"
+        assert any(
+            item["label"] == "Candidate provenance"
+            and item["value"] == "resident reported only"
+            for item in report["inferred_context"]
+        )
 
         context_response = client.get(f"/api/report/{report['id']}/model-context")
         assert context_response.status_code == 200
@@ -486,6 +541,7 @@ def test_live_classify_endpoint_uses_injected_model_adapter() -> None:
     assert payload["demo_variant"] == "street_trash_bags"
     assert payload["candidate"] == "Adapter-selected trash report"
     assert payload["model_source"] == "deterministic"
+    assert payload["intake_state"]["candidate_provenance"] == "camera_observed"
 
 
 def test_confirm_report_returns_404_for_unknown_report() -> None:

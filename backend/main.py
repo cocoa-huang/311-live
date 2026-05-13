@@ -26,6 +26,7 @@ from backend.agents.model_context import build_model_context_packet
 from backend.agents.report_builder import build_report_draft
 from backend.schemas import (
     HealthResponse,
+    IntakeState,
     LiveClassifyRequest,
     LiveClassifyResponse,
     ModelContextPacket,
@@ -41,6 +42,26 @@ from backend.tools.report_store import report_store
 
 logger = logging.getLogger("uvicorn.error")
 MAX_IMAGE_FRAME_BYTES = 2_000_000
+
+
+def _looks_like_corrupted_transcript(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return True
+
+    letters = sum(char.isalpha() for char in text)
+    digits = sum(char.isdigit() for char in text)
+    symbolic = sum(char in "^=+*/<>%$#@" for char in text)
+    words = [part for part in text.replace("'", " ").split() if part]
+    alpha_words = [word for word in words if any(char.isalpha() for char in word)]
+
+    if symbolic >= 2 and digits >= 1:
+        return True
+    if digits >= 2 and letters <= 2:
+        return True
+    if symbolic >= 1 and digits >= 1 and len(alpha_words) <= 1:
+        return True
+    return False
 
 
 def create_app(
@@ -128,6 +149,7 @@ def create_app(
             followup=candidate.followup,
             model_source=candidate.source,
             fallback_reason=candidate.fallback_reason,
+            intake_state=candidate.intake_state,
         )
 
     @app.websocket("/ws/live")
@@ -238,7 +260,10 @@ async def _run_gemini_live_session(
 
     try:
         logger.info("gemini-live: Gemini session context opened")
-        ctx: dict = {"location_label": None}
+        ctx: dict = {
+            "location_label": None,
+            "intake_state": IntakeState(),
+        }
         audio_frames = 0
         image_frames = 0
         dropped_image_frames = 0
@@ -252,6 +277,9 @@ async def _run_gemini_live_session(
                 {
                     "type": "session_ready",
                     "session_id": manager.session_id,
+                    "payload": {
+                        "intake_state": ctx["intake_state"].model_dump(mode="json")
+                    },
                 }
             )
         )
@@ -262,9 +290,9 @@ async def _run_gemini_live_session(
             if not setup_complete or location_nudge_sent or not ctx.get("location_label"):
                 return
             await manager.send_text(
-                "[System state update; do not answer this packet directly. "
-                f"Reporter GPS is approximately {ctx['location_label']}. "
-                "Use it as approximate location context and ask the resident to confirm.]"
+                f"[System context: Reporter GPS is approximately {ctx['location_label']}. "
+                "Open the session now by greeting the resident and confirming this location, "
+                "e.g. 'I have you near East 8th Street and Avenue A — is that right?']"
             )
             location_nudge_sent = True
 
@@ -272,12 +300,9 @@ async def _run_gemini_live_session(
             nonlocal visual_nudge_sent
             if visual_nudge_sent or image_frames == 0:
                 return
-            await manager.send_text(
-                "[System state update; do not answer this packet directly. "
-                "A camera frame has been received. Ground visual statements only "
-                "in visible contents. If the frame is unclear, say it is unclear "
-                "and keep resident claims separate from camera evidence.]"
-            )
+            # Do not send a text turn here. Live API client-content state nudges
+            # can cause Gemini to speak before the resident has framed the issue.
+            # A future visual-first state should request one explicit candidate.
             visual_nudge_sent = True
 
         async def _recv_from_frontend() -> None:
@@ -330,6 +355,24 @@ async def _run_gemini_live_session(
                                 )
                             await manager.send_image(jpeg_bytes)
                             if image_frames == 1:
+                                ctx["intake_state"] = ctx["intake_state"].model_copy(
+                                    update={
+                                        "frame_status": "available",
+                                        "candidate_provenance": "visual_unclear",
+                                    }
+                                )
+                                await websocket.send_text(
+                                    json.dumps(
+                                        {
+                                            "type": "intake_state_updated",
+                                            "payload": {
+                                                "intake_state": ctx[
+                                                    "intake_state"
+                                                ].model_dump(mode="json")
+                                            },
+                                        }
+                                    )
+                                )
                                 await _send_visual_nudge_if_ready()
                         elif msg_type == "start":
                             loc = (data.get("payload") or {}).get("location") or {}
@@ -368,6 +411,23 @@ async def _run_gemini_live_session(
                                 event.finished,
                                 event.text,
                             )
+                            if (
+                                event.role == "user"
+                                and event.finished
+                                and _looks_like_corrupted_transcript(event.text)
+                            ):
+                                logger.warning(
+                                    "gemini-live: likely corrupted user transcript %r",
+                                    event.text,
+                                )
+                                await manager.send_text(
+                                    "[System recovery instruction; do not answer this "
+                                    "packet directly. The immediately preceding resident "
+                                    f"utterance looked corrupted or non-semantic: {event.text!r}. "
+                                    "Do not treat it as confirmation, denial, or a usable "
+                                    "answer. Briefly say you did not catch that and ask the "
+                                    "resident to repeat their last answer.]"
+                                )
                             await websocket.send_text(
                                 json.dumps(
                                     {
@@ -402,6 +462,9 @@ async def _run_gemini_live_session(
                                 visual_status = args.get("visual_status", "")
                                 readiness_status = args.get("readiness_status", "")
                                 missing_detail = args.get("missing_required_detail", "")
+                                blocked_path = args.get("blocked_path", "")
+                                passage_status = args.get("passage_status", "")
+                                urgency_signal = args.get("urgency_signal", "")
                                 image_age = (
                                     time.monotonic() - last_image_at
                                     if last_image_at is not None
@@ -426,6 +489,38 @@ async def _run_gemini_live_session(
                                     }.items()
                                     if not str(value or "").strip()
                                 ]
+                                obstruction_like = any(
+                                    token in " ".join(
+                                        part
+                                        for part in [
+                                            issue_desc,
+                                            severity,
+                                            resident_claim,
+                                            recommended_category,
+                                        ]
+                                        if part
+                                    ).lower()
+                                    for token in [
+                                        "block",
+                                        "obstruction",
+                                        "street",
+                                        "sidewalk",
+                                        "lane",
+                                        "boxes",
+                                        "cardboard",
+                                        "trash",
+                                        "debris",
+                                        "dumping",
+                                    ]
+                                )
+                                if obstruction_like:
+                                    for field, value in {
+                                        "blocked_path": blocked_path,
+                                        "passage_status": passage_status,
+                                        "urgency_signal": urgency_signal,
+                                    }.items():
+                                        if not str(value or "").strip():
+                                            missing_fields.append(field)
                                 if readiness_status == "needs_followup" or missing_fields:
                                     await manager.respond_to_tool_call(
                                         event.call_id,
@@ -462,7 +557,29 @@ async def _run_gemini_live_session(
                                         "gemini-live: rejected visually unsupported draft tool call"
                                     )
                                     continue
-                                scenario, demo_variant = infer_live_report_path(issue_desc)
+                                candidate_provenance = (
+                                    "camera_observed"
+                                    if visual_status == "supports_claim"
+                                    and image_frames > 0
+                                    else "visual_unclear"
+                                    if image_frames > 0
+                                    else "resident_reported_only"
+                                )
+                                scenario, demo_variant = infer_live_report_path(
+                                    ". ".join(
+                                        part
+                                        for part in [
+                                            issue_desc,
+                                            severity,
+                                            resident_claim,
+                                            accessibility_impact,
+                                            recommended_category,
+                                            recommended_agency,
+                                            args.get("blocked_path", ""),
+                                        ]
+                                        if part
+                                    )
+                                )
                                 transcript_parts = [
                                     issue_desc,
                                     severity,
@@ -478,6 +595,7 @@ async def _run_gemini_live_session(
                                 request = ReportDraftRequest(
                                     scenario=scenario,  # type: ignore[arg-type]
                                     demo_variant=demo_variant,  # type: ignore[arg-type]
+                                    issue_description=issue_desc or None,
                                     transcript=full_transcript,
                                     image_summary=visual_evidence or None,
                                     location=Location(
@@ -489,6 +607,9 @@ async def _run_gemini_live_session(
                                     visual_evidence_summary=visual_evidence or None,
                                     accessibility_impact=accessibility_impact or None,
                                     recurrence=recurrence or None,
+                                    blocked_path=blocked_path or None,
+                                    passage_status=passage_status or None,
+                                    urgency_signal=urgency_signal or None,
                                     recommended_category=recommended_category or None,
                                     recommended_agency=recommended_agency or None,
                                     slot_quality_summary=(
@@ -503,7 +624,13 @@ async def _run_gemini_live_session(
                                                 if args.get("location_status")
                                                 else "",
                                                 f"blocked_path={args.get('blocked_path', '')}"
-                                                if args.get("blocked_path")
+                                                if blocked_path
+                                                else "",
+                                                f"passage_status={passage_status}"
+                                                if passage_status
+                                                else "",
+                                                f"urgency_signal={urgency_signal}"
+                                                if urgency_signal
                                                 else "",
                                             ]
                                             if part
@@ -511,9 +638,18 @@ async def _run_gemini_live_session(
                                         or None
                                     ),
                                     remaining_uncertainty=remaining_uncertainty or None,
+                                    candidate_provenance=candidate_provenance,
                                 )
                                 draft = build_report_draft(request, context_provider)
                                 report_store.save(draft)
+                                ctx["intake_state"] = ctx["intake_state"].model_copy(
+                                    update={
+                                        "candidate_provenance": candidate_provenance,
+                                        "resident_confirmed_intent": True,
+                                        "location_confirmed": True,
+                                        "draft_ready": True,
+                                    }
+                                )
                                 await manager.respond_to_tool_call(
                                     event.call_id,
                                     event.name,
@@ -524,6 +660,9 @@ async def _run_gemini_live_session(
                                     "payload": {
                                         "report_id": draft.id,
                                         "report": draft.model_dump(mode="json"),
+                                        "intake_state": ctx[
+                                            "intake_state"
+                                        ].model_dump(mode="json"),
                                     },
                                 }
                                 logger.info(

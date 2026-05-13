@@ -65,6 +65,18 @@ class CivicContext(BaseModel):
     fallback_reason: Optional[str] = None
 
 
+class IntakeState(BaseModel):
+    frame_status: Literal["not_available", "available", "not_required"] = "not_available"
+    candidate_provenance: Literal[
+        "camera_observed",
+        "resident_reported_only",
+        "visual_unclear",
+    ] = "resident_reported_only"
+    resident_confirmed_intent: bool = False
+    location_confirmed: bool = False
+    draft_ready: bool = False
+
+
 class EvidenceItem(BaseModel):
     kind: Literal["text", "audio", "image", "location"]
     summary: str
@@ -122,6 +134,7 @@ class ReportDraftRequest(BaseModel):
             "street_trash_bags",
         ]
     ] = None
+    issue_description: Optional[str] = None
     transcript: Optional[str] = None
     image_summary: Optional[str] = None
     location: Optional[Location] = None
@@ -129,10 +142,18 @@ class ReportDraftRequest(BaseModel):
     visual_evidence_summary: Optional[str] = None
     accessibility_impact: Optional[str] = None
     recurrence: Optional[str] = None
+    blocked_path: Optional[str] = None
+    passage_status: Optional[str] = None
+    urgency_signal: Optional[str] = None
     recommended_category: Optional[str] = None
     recommended_agency: Optional[str] = None
     slot_quality_summary: Optional[str] = None
     remaining_uncertainty: Optional[str] = None
+    candidate_provenance: Optional[
+        Literal["camera_observed", "resident_reported_only", "visual_unclear"]
+    ] = None
+    near_school_or_transit: Optional[bool] = None
+    special_population_impact: Optional[str] = None
 
 
 class LiveClassifyRequest(BaseModel):
@@ -155,6 +176,7 @@ class LiveClassifyResponse(BaseModel):
     followup: str
     model_source: str
     fallback_reason: Optional[str] = None
+    intake_state: IntakeState = Field(default_factory=IntakeState)
 
 
 class ReportConfirmRequest(BaseModel):

@@ -10,7 +10,7 @@ from backend.agents.live_model import (
     candidate_for_variant,
 )
 from backend.agents.report_builder import build_report_draft
-from backend.schemas import Location, ReportDraft, ReportDraftRequest
+from backend.schemas import IntakeState, Location, ReportDraft, ReportDraftRequest
 from backend.tools.nyc_311_context import CivicContextProvider
 
 
@@ -59,11 +59,15 @@ class LiveSession:
         self.demo_variant = "baseline"
         self.candidate_confirmed = False
         self.location_confirmed = False
+        self.intake_state = IntakeState()
 
     def start(self, payload: dict[str, Any]) -> LiveEvent:
         self.location = _location_from_payload(payload.get("location"))
         if self.location and self.location.confirmed:
             self.location_confirmed = True
+            self.intake_state = self.intake_state.model_copy(
+                update={"location_confirmed": True}
+            )
         return self._event(
             "session_started",
             "Live reporting session is ready.",
@@ -74,6 +78,7 @@ class LiveSession:
                     "video_input": "browser camera preview",
                     "future_live_model": "Gemini Live through Vertex AI",
                 },
+                "intake_state": self.intake_state.model_dump(mode="json"),
             },
         )
 
@@ -93,6 +98,9 @@ class LiveSession:
         )
         self.scenario = candidate.scenario
         self.demo_variant = candidate.demo_variant
+        self.intake_state = candidate.intake_state.model_copy(
+            update={"location_confirmed": self.location_confirmed}
+        )
         return self._event(
             "candidate_detected",
             candidate.confirmation,
@@ -105,11 +113,15 @@ class LiveSession:
                 "location_confirmed": self.location_confirmed,
                 "model_source": candidate.source,
                 "fallback_reason": candidate.fallback_reason,
+                "intake_state": self.intake_state.model_dump(mode="json"),
             },
         )
 
     def confirm_intent(self) -> LiveEvent:
         self.candidate_confirmed = True
+        self.intake_state = self.intake_state.model_copy(
+            update={"resident_confirmed_intent": True}
+        )
         candidate = candidate_for_variant(self.demo_variant)
         return self._event(
             "followup_required",
@@ -117,6 +129,7 @@ class LiveSession:
             {
                 "requires_location_confirmation": not self.location_confirmed,
                 "location": self.location.model_dump() if self.location else None,
+                "intake_state": self.intake_state.model_dump(mode="json"),
             },
         )
 
@@ -133,10 +146,16 @@ class LiveSession:
                 confirmed=True,
             )
         self.location_confirmed = True
+        self.intake_state = self.intake_state.model_copy(
+            update={"location_confirmed": True}
+        )
         return self._event(
             "followup_required",
             "Location confirmed. I can create the draft for resident review.",
-            {"requires_location_confirmation": False},
+            {
+                "requires_location_confirmation": False,
+                "intake_state": self.intake_state.model_dump(mode="json"),
+            },
         )
 
     def create_draft(self) -> LiveEvent:
@@ -155,15 +174,20 @@ class LiveSession:
             transcript=self.transcript,
             image_summary=self.image_summary,
             location=self.location,
+            candidate_provenance=self.intake_state.candidate_provenance,
         )
         draft = build_report_draft(request, self.context_provider)
+        self.intake_state = self.intake_state.model_copy(update={"draft_ready": True})
         return self._draft_event(draft)
 
     def _draft_event(self, draft: ReportDraft) -> LiveEvent:
         return self._event(
             "draft_ready",
             "Draft report is ready for resident review.",
-            {"report": draft.model_dump(mode="json")},
+            {
+                "report": draft.model_dump(mode="json"),
+                "intake_state": self.intake_state.model_dump(mode="json"),
+            },
         )
 
     def _event(

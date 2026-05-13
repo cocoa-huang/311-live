@@ -7,6 +7,7 @@ from backend.agents.live_model import (
     DeterministicLiveModelAdapter,
     GeminiVertexLiveModelAdapter,
     image_bytes_from_data_url,
+    infer_live_report_path,
     LiveModelConfigurationError,
     LiveObservation,
     live_model_adapter_from_settings,
@@ -27,6 +28,26 @@ def test_deterministic_live_model_detects_trash_report_path() -> None:
     assert candidate.demo_variant == "street_trash_bags"
     assert "trash" in candidate.candidate.lower()
     assert candidate.source == "deterministic"
+    assert candidate.intake_state.candidate_provenance == "resident_reported_only"
+
+
+def test_live_report_path_maps_generic_sidewalk_obstruction_to_sanitation() -> None:
+    scenario, demo_variant = infer_live_report_path(
+        "Sidewalk obstruction caused by an object. "
+        "Pedestrians need to walk around it and wheelchair users may be affected."
+    )
+
+    assert scenario == "trash_bags_on_street"
+    assert demo_variant == "street_trash_bags"
+
+
+def test_live_report_path_keeps_flooding_crosswalk_signal() -> None:
+    scenario, demo_variant = infer_live_report_path(
+        "Standing water is blocking the crosswalk near the school."
+    )
+
+    assert scenario == "flooding_near_school_crossing"
+    assert demo_variant == "blocked_crosswalk"
 
 
 def test_live_model_factory_defaults_to_deterministic_adapter() -> None:
@@ -125,3 +146,19 @@ def test_image_bytes_from_data_url_accepts_jpeg_data_url() -> None:
 def test_image_bytes_from_data_url_rejects_non_image_payload() -> None:
     with pytest.raises(ValueError):
         image_bytes_from_data_url("data:text/plain;base64,SGVsbG8=")
+
+
+def test_model_candidate_marks_camera_observed_when_frame_is_present() -> None:
+    adapter = DeterministicLiveModelAdapter()
+
+    candidate = asyncio.run(
+        adapter.detect_candidate(
+            LiveObservation(
+                transcript="Trash bags are blocking the sidewalk here.",
+                image_frame="data:image/jpeg;base64,/9j/",
+            )
+        )
+    )
+
+    assert candidate.intake_state.frame_status == "available"
+    assert candidate.intake_state.candidate_provenance == "camera_observed"

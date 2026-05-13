@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowRight,
   Camera,
@@ -24,6 +24,7 @@ import {
   type ReportScenario,
   type ReportDraft,
   type ReportUpdateRequest,
+  type IntakeState,
 } from "@/lib/api";
 
 type Phase =
@@ -96,6 +97,7 @@ interface LiveAgentEvent {
     followup?: string;
     requires_location_confirmation?: boolean;
     report?: ReportDraft;
+    intake_state?: IntakeState;
   };
 }
 
@@ -114,8 +116,8 @@ const demoVariants: Array<{
     label: "Baseline",
     state: "Needs exact location",
     candidate: "Flooding near a school crossing",
-    confirmation: "I see standing water near a school crossing. Is that what you want to report?",
-    followup: "Can you confirm the exact crossing before I draft the report?",
+    confirmation: "You described standing water near a school crossing. Is that what you want to report?",
+    followup: "Can you confirm the exact crossing? And is this near a school entrance or transit stop where it could affect students or commuters?",
   },
   {
     id: "confirmed_location",
@@ -123,8 +125,8 @@ const demoVariants: Array<{
     label: "Confirmed",
     state: "Location ready",
     candidate: "Flooding at a confirmed school crossing",
-    confirmation: "I see flooding at the confirmed crossing. Should I prepare this as a 311 report?",
-    followup: "Is the water actively rising or blocking the curb ramp?",
+    confirmation: "You confirmed flooding at this crossing. Should I prepare this as a 311 report?",
+    followup: "Is the water actively rising or blocking the curb ramp? Is this near a school entrance or transit stop?",
   },
   {
     id: "blocked_crosswalk",
@@ -132,8 +134,8 @@ const demoVariants: Array<{
     label: "Blocked",
     state: "Higher safety signal",
     candidate: "Crosswalk access blocked by standing water",
-    confirmation: "It looks like water may be forcing pedestrians toward traffic. Is that the issue?",
-    followup: "Is the crosswalk fully blocked or still partly passable?",
+    confirmation: "It sounds like water may be forcing pedestrians toward traffic. Is that the issue?",
+    followup: "Is the crosswalk fully blocked or still partly passable? Is this near a school or transit stop — are students or commuters affected?",
   },
   {
     id: "visible_drain_obstruction",
@@ -141,8 +143,8 @@ const demoVariants: Array<{
     label: "Drain",
     state: "Catch basin visible",
     candidate: "Possible clogged catch basin causing flooding",
-    confirmation: "I see flooding and possible debris near a drain. Is that what you want to report?",
-    followup: "Is the drain covered by leaves, trash, or another obstruction?",
+    confirmation: "It sounds like there is flooding with possible debris near a drain. Is that what you want to report?",
+    followup: "Is the drain covered by leaves, trash, or another obstruction? Is this near a school or transit stop?",
   },
   {
     id: "street_trash_bags",
@@ -150,8 +152,8 @@ const demoVariants: Array<{
     label: "Trash",
     state: "Works anywhere",
     candidate: "Trash bags on the street or sidewalk",
-    confirmation: "I see bagged trash or loose refuse near your current location. Is that what you want to report?",
-    followup: "Are the bags blocking the sidewalk, curb, bike lane, or street?",
+    confirmation: "It sounds like there is bagged trash or loose refuse near your location. Is that what you want to report?",
+    followup: "Are the bags blocking the sidewalk, curb, bike lane, or street? Is this near a school or transit stop where it could affect students or commuters?",
   },
 ];
 
@@ -179,6 +181,9 @@ export default function CitizenApp() {
   const playbackContextRef = useRef<AudioContext | null>(null);
   const playbackCursorRef = useRef<number>(0);
   const cameraFrameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const subtitleQueueRef = useRef<string[]>([]);
+  const subtitleTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const modelTurnActiveRef = useRef(false);
   const [mounted, setMounted] = useState(false);
   const [phase, setPhase] = useState<Phase>("ready");
   const [draft, setDraft] = useState<ReportDraft | null>(null);
@@ -203,6 +208,7 @@ export default function CitizenApp() {
   const [error, setError] = useState<string | null>(null);
   const [userSpeaking, setUserSpeaking] = useState<string>("");
   const [cameraFramesSent, setCameraFramesSent] = useState(0);
+  const [intakeState, setIntakeState] = useState<IntakeState | null>(null);
 
   const geminiLiveMode = !!liveWebSocketUrl();
   const activeVariant = detectedVariant ?? inferIssueVariant(issueDescription);
@@ -217,13 +223,7 @@ export default function CitizenApp() {
     }
   }, [phase]);
 
-  useEffect(() => {
-    return () => {
-      stopLiveInputs();
-    };
-  }, []);
-
-  function stopLiveInputs() {
+  const stopLiveInputs = useCallback(() => {
     recognitionRef.current?.stop();
     recognitionRef.current = null;
     liveSocketRef.current?.close();
@@ -236,6 +236,7 @@ export default function CitizenApp() {
       clearInterval(cameraFrameIntervalRef.current);
       cameraFrameIntervalRef.current = null;
     }
+    stopSubtitleStream();
     audioInWorkletRef.current = null;
     audioInContextRef.current?.close().catch(() => {});
     audioInContextRef.current = null;
@@ -247,8 +248,55 @@ export default function CitizenApp() {
     setCameraStatus("idle");
     setMicrophoneStatus("idle");
     setLiveAgentStatus("offline");
+    setLiveAgentMessage(null);
     setUserSpeaking("");
     setCameraFramesSent(0);
+    setIntakeState(null);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopLiveInputs();
+    };
+  }, [stopLiveInputs]);
+
+  function stopSubtitleStream() {
+    if (subtitleTimerRef.current !== null) {
+      clearInterval(subtitleTimerRef.current);
+      subtitleTimerRef.current = null;
+    }
+    subtitleQueueRef.current = [];
+    modelTurnActiveRef.current = false;
+  }
+
+  function enqueueModelSubtitle(text: string) {
+    const tokens = text.trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return;
+
+    if (!modelTurnActiveRef.current) {
+      modelTurnActiveRef.current = true;
+      subtitleQueueRef.current = [];
+      setLiveAgentMessage("");
+    }
+
+    subtitleQueueRef.current.push(...tokens);
+    if (subtitleTimerRef.current !== null) return;
+
+    subtitleTimerRef.current = setInterval(() => {
+      const next = subtitleQueueRef.current.shift();
+      if (!next) {
+        if (subtitleTimerRef.current !== null) {
+          clearInterval(subtitleTimerRef.current);
+          subtitleTimerRef.current = null;
+        }
+        return;
+      }
+      setLiveAgentMessage((current) => {
+        if (!current) return next;
+        const separator = /^[,.;:!?)]/.test(next) ? "" : " ";
+        return `${current}${separator}${next}`;
+      });
+    }, 145);
   }
 
   function currentLocationPayload(confirmed = false) {
@@ -316,9 +364,11 @@ export default function CitizenApp() {
     setIssueDescription("");
     setDetectedVariant(null);
     setInterimTranscript("");
+    stopSubtitleStream();
     setLiveAgentMessage(null);
     setCandidateFollowup(null);
     setLiveAgentStatus("offline");
+    setIntakeState(null);
     setPhase("permissions");
     requestAnimationFrame(() => {
       livePanelRef.current?.scrollIntoView({
@@ -387,6 +437,8 @@ export default function CitizenApp() {
 
       // Gemini Live events
       if (eventType === "session_ready") {
+        const payload = data.payload as LiveAgentEvent["payload"];
+        setIntakeState(payload?.intake_state ?? null);
         setLiveAgentStatus("ready");
         startCameraFrameCapture(socket);
         if (geminiLiveMode) {
@@ -402,16 +454,25 @@ export default function CitizenApp() {
         const text = data.text as string;
         const finished = data.finished as boolean;
         if (role === "model") {
-          setLiveAgentMessage(text);
+          enqueueModelSubtitle(text);
           setLiveAgentStatus("thinking");
         } else if (role === "user" && finished) {
           setUserSpeaking(text);
         }
       } else if (eventType === "turn_complete") {
+        modelTurnActiveRef.current = false;
         setLiveAgentStatus("ready");
+      } else if (eventType === "intake_state_updated") {
+        const payload = data.payload as LiveAgentEvent["payload"];
+        setIntakeState(payload?.intake_state ?? null);
       } else if (eventType === "draft_ready") {
-        const payload = data.payload as { report?: ReportDraft; report_id?: string };
+        const payload = data.payload as {
+          report?: ReportDraft;
+          report_id?: string;
+          intake_state?: IntakeState;
+        };
         if (payload?.report) {
+          setIntakeState(payload.intake_state ?? null);
           setDraft(payload.report);
           setPhase("draft");
           setLoading(false);
@@ -419,9 +480,12 @@ export default function CitizenApp() {
         }
       // Legacy deterministic events
       } else if (eventType === "session_started") {
+        const payload = data.payload as LiveAgentEvent["payload"];
+        setIntakeState(payload?.intake_state ?? null);
         setLiveAgentStatus("ready");
       } else if (eventType === "candidate_detected") {
         const payload = data.payload as LiveAgentEvent["payload"];
+        setIntakeState(payload?.intake_state ?? null);
         if (payload?.demo_variant) {
           const nextVariant = demoVariants.find((v) => v.id === payload.demo_variant);
           if (nextVariant) {
@@ -432,6 +496,10 @@ export default function CitizenApp() {
         }
         setLiveAgentStatus("ready");
       } else if (eventType === "followup_required") {
+        const payload = data.payload as LiveAgentEvent["payload"];
+        if (payload?.intake_state) {
+          setIntakeState(payload.intake_state);
+        }
         setPhase("followup");
         setLiveAgentStatus("ready");
       } else if (eventType === "location_confirmation_required") {
@@ -732,7 +800,6 @@ export default function CitizenApp() {
           type: "observation",
           payload: {
             transcript: issueDescription.trim(),
-            image_summary: activeVariant.candidate,
             location: currentLocationPayload(false),
           },
         }),
@@ -746,7 +813,7 @@ export default function CitizenApp() {
         issueDescription.trim(),
         imageFrame
           ? "Still frame captured from the resident's active camera preview."
-          : activeVariant.candidate,
+          : undefined,
         imageFrame?.dataUrl,
         currentLocationPayload(false),
       );
@@ -756,6 +823,7 @@ export default function CitizenApp() {
       setDetectedVariant(nextVariant ?? inferIssueVariant(issueDescription));
       setLiveAgentMessage(classified.confirmation);
       setCandidateFollowup(classified.followup);
+      setIntakeState(classified.intake_state);
       setPhase("candidate");
       setLiveAgentStatus(
         classified.model_source === "deterministic-fallback" ? "fallback" : "ready",
@@ -921,40 +989,75 @@ export default function CitizenApp() {
     setLiveAgentMessage(null);
     setCandidateFollowup(null);
     setLiveAgentStatus("offline");
+    setIntakeState(null);
   }
 
+  // Derived step index for the workflow tracker
+  const activeStep =
+    phase === "ready" || phase === "permissions" ? 0
+    : phase === "observing" ? 1
+    : phase === "candidate" || phase === "followup" ? 2
+    : phase === "draft" ? 3
+    : 4;
+
   return (
-    <main className="min-h-screen bg-field">
-      <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col px-4 py-5 sm:px-6 lg:px-8">
-        <header className="flex items-center justify-between gap-4 border-b border-ink/10 pb-4">
-          <div>
-            <p className="text-sm font-semibold uppercase tracking-wide text-signal">
-              311 Live
-            </p>
-            <h1 className="text-3xl font-black text-ink sm:text-4xl">
-              Show it. Say it. Solve it.
-            </h1>
+    <main className="min-h-screen bg-field font-sans">
+      {/* NYC 311 brand bar */}
+      <div className="h-[3px] w-full bg-brand" />
+
+      {/* Sticky header */}
+      <header className="sticky top-0 z-20 bg-white shadow-[0_1px_0_0_rgba(0,0,0,0.1)]">
+        <div className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-4 py-3 sm:px-6 lg:px-8">
+          <div className="flex items-center gap-3">
+            {/* NYC 311 badge — black box, yellow border */}
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center border-[2.5px] border-brand bg-ink">
+              <div className="text-center">
+                <span className="block text-[8px] font-black uppercase leading-none tracking-[0.2em] text-brand">
+                  NYC
+                </span>
+                <span className="block text-[15px] font-black leading-none text-white">
+                  311
+                </span>
+              </div>
+            </div>
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-[0.2em] text-ink/35">
+                Live Report
+              </p>
+              <h1 className="text-lg font-black leading-tight text-ink sm:text-xl">
+                Show it. Say it. Solve it.
+              </h1>
+            </div>
           </div>
           <button
             type="button"
             onClick={resetDemo}
-            className="focus-ring flex h-11 w-11 shrink-0 items-center justify-center rounded-md border border-ink/10 bg-white text-ink shadow-sm transition hover:bg-ink hover:text-white"
+            className="focus-ring flex h-9 w-9 shrink-0 items-center justify-center border border-ink/15 bg-white text-ink/45 transition hover:border-ink hover:bg-ink hover:text-white"
             aria-label="Reset demo"
           >
-            <RotateCcw size={18} />
+            <RotateCcw size={15} />
           </button>
-        </header>
+        </div>
+      </header>
 
-        <div className="grid flex-1 grid-cols-1 gap-5 py-5 lg:grid-cols-[360px_1fr]">
+      {/* Page content */}
+      <div className="mx-auto max-w-5xl px-4 py-6 sm:px-6 lg:px-8">
+        <div className="grid grid-cols-1 gap-5 lg:grid-cols-[340px_1fr]">
+
+          {/* ── Sidebar ── */}
           <aside className="order-2 space-y-4 lg:order-1">
-            <section className="rounded-md border border-ink/10 bg-white p-4 shadow-sm">
-              <p className="text-xs font-semibold uppercase tracking-wide text-ink/55">
-                Live Intake
-              </p>
-              <h2 className="mt-1 text-xl font-bold text-ink">
-                Report with camera, voice, and location
-              </h2>
-              <div className="mt-4 grid grid-cols-1 gap-2">
+
+            {/* Intake controls card */}
+            <section className="bg-white shadow-card">
+              <div className="border-l-[3px] border-brand px-5 py-4">
+                <p className="text-[9px] font-black uppercase tracking-[0.25em] text-ink/35">
+                  Live Intake
+                </p>
+                <h2 className="mt-0.5 text-base font-black text-ink">
+                  Camera · Voice · Location
+                </h2>
+              </div>
+              <div className="space-y-1.5 border-t border-ink/8 px-4 pb-4 pt-3">
                 <StatusPill
                   kind="camera"
                   label="Camera"
@@ -1007,39 +1110,93 @@ export default function CitizenApp() {
                   }
                 />
               </div>
-
-              <button
-                type="button"
-                onClick={startReport}
-                disabled={loading || phase !== "ready"}
-                className="focus-ring mt-5 flex min-h-12 w-full items-center justify-center gap-2 rounded-md bg-ink px-4 py-3 font-bold text-white transition hover:bg-civic disabled:cursor-wait disabled:bg-ink/45"
-              >
-                <Play size={18} aria-hidden="true" />
-                Start Report
-              </button>
+              <div className="space-y-3 border-t border-ink/8 px-4 pb-4 pt-3">
+                <button
+                  type="button"
+                  onClick={startReport}
+                  disabled={loading || phase !== "ready"}
+                  className="focus-ring flex min-h-12 w-full items-center justify-center gap-2 bg-brand px-4 py-3 font-black text-ink shadow-sm transition hover:bg-brand/80 active:scale-[0.98] disabled:cursor-wait disabled:bg-ink/12 disabled:text-ink/35 disabled:shadow-none"
+                >
+                  <Play size={17} aria-hidden="true" />
+                  Start Report
+                </button>
+                <div className="flex items-start gap-2 border border-red-200 bg-red-50 px-3 py-2.5">
+                  <span className="mt-px shrink-0 text-xs font-black text-red-600">!</span>
+                  <p className="text-xs leading-5 text-red-700">
+                    For non-emergency city reports only.{" "}
+                    <strong className="font-black">Call 911</strong> for immediate danger.
+                  </p>
+                </div>
+              </div>
             </section>
 
-            <section className="rounded-md border border-ink/10 bg-white p-4 shadow-sm">
-              <p className="text-xs font-semibold uppercase tracking-wide text-ink/55">
-                Workflow
-              </p>
-              <ol className="mt-3 space-y-3 text-sm text-ink/72">
-                {["Start", "Observe", "Confirm", "Draft", "Review"].map((item, index) => (
-                  <li key={item} className="flex items-center gap-3">
-                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-field text-xs font-bold text-civic">
-                      {index + 1}
-                    </span>
-                    <span>{item}</span>
-                    {index < 4 && <ArrowRight size={14} className="ml-auto text-ink/30" />}
-                  </li>
-                ))}
-              </ol>
+            {/* Workflow tracker */}
+            <section className="bg-white shadow-card">
+              <div className="border-l-[3px] border-brand px-5 py-4">
+                <p className="text-[9px] font-black uppercase tracking-[0.25em] text-ink/35">
+                  Workflow
+                </p>
+              </div>
+              <div className="border-t border-ink/8 px-4 py-3">
+                <ol className="space-y-0.5">
+                  {(["Start", "Observe", "Confirm", "Draft", "Review"] as const).map(
+                    (item, index) => {
+                      const isActive = activeStep === index;
+                      const isDone = activeStep > index;
+                      return (
+                        <li
+                          key={item}
+                          className={`flex items-center gap-3 px-3 py-2.5 transition-colors ${
+                            isActive ? "bg-brand/12" : ""
+                          }`}
+                        >
+                          <span
+                            className={`flex h-7 w-7 shrink-0 items-center justify-center text-xs font-black transition-all ${
+                              isActive
+                                ? "bg-brand text-ink"
+                                : isDone
+                                  ? "bg-signal/12 text-signal"
+                                  : "bg-field text-ink/30"
+                            }`}
+                          >
+                            {isDone ? "✓" : index + 1}
+                          </span>
+                          <span
+                            className={`text-sm font-bold ${
+                              isActive
+                                ? "text-ink"
+                                : isDone
+                                  ? "text-signal"
+                                  : "text-ink/35"
+                            }`}
+                          >
+                            {item}
+                          </span>
+                          {isActive && (
+                            <span className="ml-auto text-[9px] font-black uppercase tracking-widest text-ink/40">
+                              Now
+                            </span>
+                          )}
+                          {!isActive && index < 4 && (
+                            <ArrowRight
+                              size={12}
+                              className="ml-auto text-ink/15"
+                              aria-hidden="true"
+                            />
+                          )}
+                        </li>
+                      );
+                    },
+                  )}
+                </ol>
+              </div>
             </section>
           </aside>
 
+          {/* ── Main content ── */}
           <div className="order-1 space-y-5 lg:order-2">
             {error && (
-              <div className="rounded-md border border-red-200 bg-red-50 p-4 text-sm font-semibold text-red-800">
+              <div className="border border-red-200 bg-red-50 px-4 py-3 text-sm font-bold text-red-700">
                 {error}
               </div>
             )}
@@ -1047,20 +1204,25 @@ export default function CitizenApp() {
             {phase !== "draft" && phase !== "confirmed" ? (
               <section
                 ref={livePanelRef}
-                className="scroll-mt-4 rounded-md border border-ink/10 bg-white p-5 shadow-sm"
+                className="scroll-mt-4 overflow-hidden bg-white shadow-card"
               >
-                <p className="text-xs font-semibold uppercase tracking-wide text-ink/55">
-                  {phase === "ready" ? "Ready" : "Live agent simulator"}
-                </p>
-                <h2 className="mt-1 text-2xl font-bold text-ink">
-                  {phase === "ready"
-                    ? "Start a live report"
-                    : phase === "observing"
-                      ? "Describe what you see"
-                      : activeVariant.candidate}
-                </h2>
-                <div className="mt-4 overflow-hidden rounded-md bg-ink text-white">
-                  <div className="relative aspect-[4/5] min-h-[300px] bg-black sm:aspect-video sm:min-h-[360px]">
+                {/* Panel header */}
+                <div className="border-l-[3px] border-brand px-5 py-4">
+                  <p className="text-[9px] font-black uppercase tracking-[0.25em] text-ink/35">
+                    {phase === "ready" ? "Ready" : "Live Agent"}
+                  </p>
+                  <h2 className="mt-0.5 text-lg font-black text-ink">
+                    {phase === "ready"
+                      ? "Start a live 311 report"
+                      : phase === "observing"
+                        ? "Describe what you see"
+                        : activeVariant.candidate}
+                  </h2>
+                </div>
+
+                {/* Camera view */}
+                <div className="relative bg-ink">
+                  <div className="relative aspect-[4/5] min-h-[280px] bg-[#0a0c10] sm:aspect-video sm:min-h-[320px]">
                     {mounted && (
                       <video
                         ref={videoRef}
@@ -1073,236 +1235,324 @@ export default function CitizenApp() {
                       />
                     )}
                     <div
-                        className={`absolute inset-0 flex flex-col justify-between p-3 sm:p-4 ${
-                        cameraStatus === "active" ? "bg-black/25" : ""
+                      className={`absolute inset-0 flex flex-col justify-between p-4 ${
+                        cameraStatus === "active"
+                          ? "bg-gradient-to-b from-black/55 via-transparent to-black/65"
+                          : "bg-[#0a0c10]"
                       }`}
                     >
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="flex items-center gap-2">
-                        <Camera size={18} />
-                        <span className="text-sm font-bold">Camera view</span>
+                      {/* HUD top row */}
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <Camera size={14} className="text-brand" />
+                          <span className="text-[11px] font-black uppercase tracking-widest text-white/70">
+                            Camera
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {cameraFramesSent > 0 && (
+                            <span className="bg-white/10 px-2 py-0.5 font-mono text-[10px] font-bold text-brand/90 backdrop-blur-sm">
+                              FRAMES {cameraFramesSent}
+                            </span>
+                          )}
+                          <span
+                            className={`px-2 py-0.5 text-[10px] font-black uppercase tracking-widest backdrop-blur-sm ${
+                              cameraStatus === "active"
+                                ? "animate-blink-live bg-brand text-ink"
+                                : "bg-white/10 text-white/50"
+                            }`}
+                          >
+                            {cameraStatus === "active"
+                              ? "● LIVE"
+                              : phase === "ready"
+                                ? "INACTIVE"
+                                : "WAITING"}
+                          </span>
+                        </div>
                       </div>
-                      <span className="rounded-sm bg-white/12 px-2 py-1 text-xs font-semibold">
-                        {cameraStatus === "active"
-                          ? "Live"
-                          : phase === "ready"
-                            ? "Inactive"
-                            : "Waiting"}
-                      </span>
-                    </div>
-                    <div>
-                        <p className="text-xl font-black sm:text-2xl">
-                        {cameraStatus !== "active"
-                          ? "Point your camera at the issue."
-                          : phase === "candidate" || phase === "followup"
-                            ? activeVariant.candidate
-                            : geminiLiveMode && phase === "observing"
-                              ? "Speak naturally — I'm listening."
-                              : "Describe what you see."}
-                      </p>
-                      <p className="mt-3 max-w-xl text-sm leading-6 text-white/72">
-                        {phase === "ready"
-                          ? "The live agent will observe, listen, confirm intent, and draft only after reviewable context is available."
-                          : phase === "observing"
-                            ? geminiLiveMode
-                              ? cameraFramesSent > 0
-                                ? "Gemini is listening with camera context. Describe the issue and severity."
-                                : "Gemini is listening. Camera context has not been sent yet."
-                              : "Tell me what you are seeing, then I will identify the likely 311 issue."
-                            : activeVariant.confirmation}
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap gap-2 text-xs font-semibold">
-                      <span className="rounded-sm bg-white/12 px-2 py-1">Camera</span>
-                      <span className="rounded-sm bg-white/12 px-2 py-1">Mic</span>
-                      <span className="rounded-sm bg-white/12 px-2 py-1">
-                        Frames {cameraFramesSent}
-                      </span>
-                      <span className="rounded-sm bg-white/12 px-2 py-1">
-                        Demo geolock
-                      </span>
-                      <span className="rounded-sm bg-signal px-2 py-1">DTPR visible</span>
-                    </div>
+
+                      {/* HUD bottom — DTPR chips */}
+                      <div className="flex flex-wrap gap-1.5">
+                        {(["Camera", "Mic", "Demo geolock"] as const).map((chip) => (
+                          <span
+                            key={chip}
+                            className="bg-white/10 px-2 py-1 text-[10px] font-bold text-white/75 backdrop-blur-sm"
+                          >
+                            {chip}
+                          </span>
+                        ))}
+                        <span className="bg-signal/80 px-2 py-1 text-[10px] font-bold text-white backdrop-blur-sm">
+                          DTPR visible
+                        </span>
+                      </div>
                     </div>
                   </div>
                 </div>
 
-                <div className="mt-3 rounded-md border border-ink/10 bg-field p-4">
-                  <div className="flex items-start gap-3">
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-white text-civic">
-                      <Mic size={18} />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-bold text-ink">
-                        {liveAgentStatus === "thinking" ? "Agent — speaking…" : "Agent"}
-                      </p>
-                      <p className="mt-1 text-sm leading-6 text-ink/72">
-                        {phase === "ready" &&
-                          "Tap Start Report when you are ready to capture the issue."}
-                        {phase === "permissions" &&
-                          "I will use camera, microphone, and location only for this report flow. Continue?"}
-                        {phase === "observing" &&
-                          (liveAgentMessage ||
-                            (geminiLiveMode
-                              ? cameraFramesSent > 0
-                                ? "Session ready. I have demo location and camera context."
-                                : "Session ready. I have demo location; waiting for camera frames."
-                              : "Tell me what you are seeing, then I will identify the likely 311 issue."))}
-                        {phase === "candidate" &&
-                          (liveAgentMessage || activeVariant.confirmation)}
-                        {phase === "followup" && (liveAgentMessage || activeVariant.followup)}
-                      </p>
-                      {geminiLiveMode && phase === "observing" && userSpeaking && (
-                        <p className="mt-2 rounded-sm bg-white px-2 py-1 text-xs text-ink/55">
-                          <span className="font-semibold text-ink/72">You:</span>{" "}
-                          {userSpeaking}
-                        </p>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                {(phase === "observing" ||
-                  phase === "candidate" ||
-                  phase === "followup") &&
-                  !(geminiLiveMode && phase === "observing" && liveAgentStatus !== "fallback") && (
-                  <div className="mt-3 rounded-md border border-ink/10 bg-white p-3">
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-xs font-semibold uppercase tracking-wide text-ink/55">
-                        Resident description
-                      </span>
-                      <div className="flex shrink-0 items-center gap-2">
-                        {phase === "observing" && issueDescription && (
-                          <button
-                            type="button"
-                            onClick={retryDescription}
-                            className="focus-ring min-h-10 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm font-bold text-ink transition hover:border-civic hover:text-civic"
-                          >
-                            Clear
-                          </button>
-                        )}
-                        {(phase === "candidate" || phase === "followup") && (
-                          <button
-                            type="button"
-                            onClick={correctCandidate}
-                            className="focus-ring min-h-10 rounded-md border border-ink/15 bg-white px-3 py-2 text-sm font-bold text-ink transition hover:border-civic hover:text-civic"
-                          >
-                            Correct
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={startVoiceCapture}
-                          disabled={microphoneStatus === "active"}
-                          className="focus-ring flex min-h-10 items-center justify-center gap-2 rounded-md bg-civic px-3 py-2 text-sm font-bold text-white transition hover:bg-ink disabled:cursor-wait disabled:bg-ink/35"
-                        >
-                          <Mic size={16} aria-hidden="true" />
-                          {microphoneStatus === "active" ? "Listening..." : "Speak"}
-                        </button>
-                      </div>
-                    </div>
-                    {(interimTranscript || issueDescription) && (
-                      <div className="mt-2 rounded-md bg-field p-3 text-sm leading-6 text-ink/72">
-                        {issueDescription}
-                        {interimTranscript && (
-                          <span className="text-ink/45"> {interimTranscript}</span>
-                        )}
-                      </div>
-                    )}
-                    <textarea
-                      value={issueDescription}
-                      onChange={(event) => {
-                        setIssueDescription(event.target.value);
-                        if (phase === "observing") {
-                          setDetectedVariant(null);
-                        }
-                      }}
-                      rows={2}
-                      className="focus-ring mt-2 w-full resize-none rounded-md border border-ink/15 bg-field px-3 py-2 text-base leading-6 text-ink"
-                      placeholder="Voice fallback: There are trash bags blocking the sidewalk here."
-                    />
+                {/* Intake state chips */}
+                {intakeState && (
+                  <div className="flex flex-wrap gap-2 border-b border-ink/8 bg-field px-4 py-2.5">
+                    <span
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-bold ${
+                        intakeState.candidate_provenance === "camera_observed"
+                          ? "bg-signal/10 text-signal"
+                          : intakeState.candidate_provenance === "visual_unclear"
+                            ? "bg-caution/10 text-caution"
+                            : "bg-ink/6 text-ink/45"
+                      }`}
+                    >
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full ${
+                          intakeState.candidate_provenance === "camera_observed"
+                            ? "bg-signal"
+                            : intakeState.candidate_provenance === "visual_unclear"
+                              ? "bg-caution"
+                              : "bg-ink/25"
+                        }`}
+                      />
+                      {intakeState.candidate_provenance === "camera_observed"
+                        ? "Camera-observed candidate"
+                        : intakeState.candidate_provenance === "visual_unclear"
+                          ? "Visual evidence unclear"
+                          : "Resident-reported only"}
+                    </span>
+                    <span
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-bold ${
+                        intakeState.resident_confirmed_intent
+                          ? "bg-signal/10 text-signal"
+                          : "bg-ink/6 text-ink/45"
+                      }`}
+                    >
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full ${
+                          intakeState.resident_confirmed_intent ? "bg-signal" : "bg-ink/25"
+                        }`}
+                      />
+                      {intakeState.resident_confirmed_intent
+                        ? "Intent confirmed"
+                        : "Intent pending"}
+                    </span>
+                    <span
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-bold ${
+                        intakeState.location_confirmed
+                          ? "bg-signal/10 text-signal"
+                          : "bg-ink/6 text-ink/45"
+                      }`}
+                    >
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full ${
+                          intakeState.location_confirmed ? "bg-signal" : "bg-ink/25"
+                        }`}
+                      />
+                      {intakeState.location_confirmed
+                        ? "Location confirmed"
+                        : "Location pending"}
+                    </span>
                   </div>
                 )}
 
-                <div className="mt-5 grid grid-cols-1 gap-2 sm:grid-cols-2">
-                  {phase === "permissions" && (
-                    <button
-                      type="button"
-                      onClick={beginObserving}
-                      disabled={captureLoading}
-                      className="focus-ring flex min-h-12 items-center justify-center gap-2 rounded-md bg-ink px-4 py-3 font-bold text-white transition hover:bg-civic"
-                    >
-                      {captureLoading ? (
-                        <Loader2 className="animate-spin" size={18} aria-hidden="true" />
-                      ) : (
-                        <CheckCircle2 size={18} aria-hidden="true" />
-                      )}
-                      {captureLoading ? "Starting Capture..." : "Allow Camera + Location"}
-                    </button>
-                  )}
-                  {phase === "observing" && (!geminiLiveMode || liveAgentStatus === "fallback") && (
-                    <button
-                      type="button"
-                      onClick={showCandidate}
-                      disabled={!issueDescription.trim()}
-                      className="focus-ring flex min-h-12 items-center justify-center gap-2 rounded-md bg-ink px-4 py-3 font-bold text-white transition hover:bg-civic"
-                    >
-                      <Camera size={18} aria-hidden="true" />
-                      Detect Candidate
-                    </button>
-                  )}
-                  {phase === "observing" && geminiLiveMode && (
-                    <div className="flex min-h-12 items-center gap-2 rounded-md border border-ink/10 bg-field px-4 py-3 text-sm text-ink/55">
-                      <Loader2
-                        size={16}
-                        className={liveAgentStatus === "ready" || liveAgentStatus === "thinking" ? "animate-spin text-civic" : "text-ink/30"}
-                        aria-hidden="true"
-                      />
-                      {liveAgentStatus === "connecting"
-                        ? "Opening Gemini session…"
-                        : liveAgentStatus === "ready"
-                          ? "Listening — speak to report"
-                          : liveAgentStatus === "thinking"
-                            ? "Gemini is speaking…"
-                            : liveAgentStatus === "fallback"
-                              ? "Live session unavailable"
-                              : "Starting…"}
+                {/* Agent message + controls */}
+                <div className="space-y-3 p-4">
+                  {/* Agent bubble */}
+                  <div className="border border-ink/10 bg-field p-4">
+                    <div className="flex items-start gap-3">
+                      <div
+                        className={`flex h-9 w-9 shrink-0 items-center justify-center transition-all ${
+                          liveAgentStatus === "thinking"
+                            ? "animate-pulse-speaking bg-brand text-ink"
+                            : "bg-ink text-brand"
+                        }`}
+                      >
+                        <Mic size={16} />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[9px] font-black uppercase tracking-[0.25em] text-ink/35">
+                          {liveAgentStatus === "thinking"
+                            ? "Agent — speaking"
+                            : "NYC 311 Agent"}
+                        </p>
+                        <p className="mt-1.5 text-sm leading-6 text-ink/70">
+                          {phase === "ready" &&
+                            "Tap Start Report when you are ready to capture the issue."}
+                          {phase === "permissions" &&
+                            "I will use camera, microphone, and location only for this report flow. 311 is for non-emergency reports; call 911 for immediate danger. Continue?"}
+                          {phase === "observing" &&
+                            (liveAgentMessage ||
+                              (geminiLiveMode
+                                ? cameraFramesSent > 0
+                                  ? "Session ready. I have demo location and camera context. Say what you want to report when you are ready."
+                                  : "Session ready. I have demo location; waiting for camera frames."
+                                : "Tell me what you are seeing, then I will identify the likely 311 issue."))}
+                          {phase === "candidate" &&
+                            (liveAgentMessage || activeVariant.confirmation)}
+                          {phase === "followup" &&
+                            (liveAgentMessage || activeVariant.followup)}
+                        </p>
+                        {geminiLiveMode && phase === "observing" && userSpeaking && (
+                          <div className="mt-2.5 border border-ink/10 bg-white px-3 py-2 text-xs text-ink/55">
+                            <span className="font-black text-ink/60">You: </span>
+                            {userSpeaking}
+                          </div>
+                        )}
+                      </div>
                     </div>
-                  )}
-                  {phase === "candidate" && (
-                    <>
+                  </div>
+
+                  {/* Resident description input */}
+                  {(phase === "observing" ||
+                    phase === "candidate" ||
+                    phase === "followup") &&
+                    !(
+                      geminiLiveMode &&
+                      phase === "observing" &&
+                      liveAgentStatus !== "fallback"
+                    ) && (
+                      <div className="border border-ink/10 bg-white p-4">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-[9px] font-black uppercase tracking-[0.25em] text-ink/35">
+                            Your description
+                          </span>
+                          <div className="flex shrink-0 items-center gap-2">
+                            {phase === "observing" && issueDescription && (
+                              <button
+                                type="button"
+                                onClick={retryDescription}
+                                className="focus-ring min-h-9 border border-ink/15 bg-white px-3 py-1.5 text-sm font-bold text-ink/55 transition hover:border-ink/30 hover:text-ink"
+                              >
+                                Clear
+                              </button>
+                            )}
+                            {(phase === "candidate" || phase === "followup") && (
+                              <button
+                                type="button"
+                                onClick={correctCandidate}
+                                className="focus-ring min-h-9 border border-ink/15 bg-white px-3 py-1.5 text-sm font-bold text-ink/55 transition hover:border-ink/30 hover:text-ink"
+                              >
+                                Correct
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={startVoiceCapture}
+                              disabled={microphoneStatus === "active"}
+                              className="focus-ring flex min-h-9 items-center gap-1.5 bg-brand px-3 py-1.5 text-sm font-black text-ink transition hover:bg-brand/80 disabled:cursor-wait disabled:bg-ink/12 disabled:text-ink/35"
+                            >
+                              <Mic size={14} aria-hidden="true" />
+                              {microphoneStatus === "active" ? "Listening…" : "Speak"}
+                            </button>
+                          </div>
+                        </div>
+                        {(interimTranscript || issueDescription) && (
+                          <div className="mt-3 bg-field px-3 py-2.5 text-sm leading-6 text-ink/65">
+                            {issueDescription}
+                            {interimTranscript && (
+                              <span className="text-ink/35"> {interimTranscript}</span>
+                            )}
+                          </div>
+                        )}
+                        <textarea
+                          value={issueDescription}
+                          onChange={(event) => {
+                            setIssueDescription(event.target.value);
+                            if (phase === "observing") {
+                              setDetectedVariant(null);
+                            }
+                          }}
+                          rows={2}
+                          className="focus-ring mt-3 w-full resize-none border border-ink/15 bg-field px-3 py-2.5 text-sm leading-6 text-ink placeholder:text-ink/30"
+                          placeholder="Voice fallback: There are trash bags blocking the sidewalk here."
+                        />
+                      </div>
+                    )}
+
+                  {/* Action buttons */}
+                  <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                    {phase === "permissions" && (
                       <button
                         type="button"
-                        onClick={confirmIntent}
-                        className="focus-ring flex min-h-12 items-center justify-center gap-2 rounded-md bg-ink px-4 py-3 font-bold text-white transition hover:bg-civic"
+                        onClick={beginObserving}
+                        disabled={captureLoading}
+                        className="focus-ring col-span-full flex min-h-12 items-center justify-center gap-2 bg-brand px-4 py-3 font-black text-ink shadow-sm transition hover:bg-brand/80 active:scale-[0.98]"
                       >
-                        <CheckCircle2 size={18} aria-hidden="true" />
-                        Yes, Report This
+                        {captureLoading ? (
+                          <Loader2 className="animate-spin" size={18} aria-hidden="true" />
+                        ) : (
+                          <CheckCircle2 size={18} aria-hidden="true" />
+                        )}
+                        {captureLoading ? "Starting Capture…" : "Allow Camera + Location"}
                       </button>
-                      <button
-                        type="button"
-                        onClick={correctCandidate}
-                        className="focus-ring flex min-h-12 items-center justify-center rounded-md border border-ink/15 bg-white px-4 py-3 font-bold text-ink transition hover:border-civic hover:text-civic"
-                      >
-                        No, Correct Issue
-                      </button>
-                    </>
-                  )}
-                  {phase === "followup" && (
-                    <button
-                      type="button"
-                      onClick={generateDraft}
-                      disabled={loading}
-                      className="focus-ring flex min-h-12 items-center justify-center gap-2 rounded-md bg-ink px-4 py-3 font-bold text-white transition hover:bg-civic disabled:cursor-wait disabled:bg-ink/45"
-                    >
-                      {loading ? (
-                        <Loader2 className="animate-spin" size={18} aria-hidden="true" />
-                      ) : (
-                        <FileText size={18} aria-hidden="true" />
+                    )}
+                    {phase === "observing" &&
+                      (!geminiLiveMode || liveAgentStatus === "fallback") && (
+                        <button
+                          type="button"
+                          onClick={showCandidate}
+                          disabled={!issueDescription.trim()}
+                          className="focus-ring flex min-h-12 items-center justify-center gap-2 bg-ink px-4 py-3 font-black text-white transition hover:bg-ink/80 active:scale-[0.98] disabled:cursor-not-allowed disabled:bg-ink/15 disabled:text-ink/35"
+                        >
+                          <Camera size={18} aria-hidden="true" />
+                          Detect Candidate
+                        </button>
                       )}
-                      {loading ? "Drafting..." : "Create Draft"}
-                    </button>
-                  )}
+                    {phase === "observing" && geminiLiveMode && (
+                      <div className="flex min-h-12 items-center gap-2.5 border border-ink/12 bg-field px-4 py-3 text-sm">
+                        <Loader2
+                          size={15}
+                          className={
+                            liveAgentStatus === "ready" || liveAgentStatus === "thinking"
+                              ? "animate-spin text-brand"
+                              : "text-ink/20"
+                          }
+                          aria-hidden="true"
+                        />
+                        <span className="font-bold text-ink/55">
+                          {liveAgentStatus === "connecting"
+                            ? "Connecting to agent…"
+                            : liveAgentStatus === "ready"
+                              ? "Listening — speak to report"
+                              : liveAgentStatus === "thinking"
+                                ? "Agent is speaking…"
+                                : liveAgentStatus === "fallback"
+                                  ? "Live session unavailable"
+                                  : "Starting…"}
+                        </span>
+                      </div>
+                    )}
+                    {phase === "candidate" && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={confirmIntent}
+                          className="focus-ring flex min-h-12 items-center justify-center gap-2 bg-brand px-4 py-3 font-black text-ink shadow-sm transition hover:bg-brand/80 active:scale-[0.98]"
+                        >
+                          <CheckCircle2 size={18} aria-hidden="true" />
+                          Yes, Report This
+                        </button>
+                        <button
+                          type="button"
+                          onClick={correctCandidate}
+                          className="focus-ring flex min-h-12 items-center justify-center border border-ink/20 bg-white px-4 py-3 font-black text-ink transition hover:border-ink/40 hover:bg-field"
+                        >
+                          No, Correct Issue
+                        </button>
+                      </>
+                    )}
+                    {phase === "followup" && (
+                      <button
+                        type="button"
+                        onClick={generateDraft}
+                        disabled={loading}
+                        className="focus-ring flex min-h-12 items-center justify-center gap-2 bg-brand px-4 py-3 font-black text-ink shadow-sm transition hover:bg-brand/80 active:scale-[0.98] disabled:cursor-wait disabled:bg-ink/12 disabled:shadow-none"
+                      >
+                        {loading ? (
+                          <Loader2 className="animate-spin" size={18} aria-hidden="true" />
+                        ) : (
+                          <FileText size={18} aria-hidden="true" />
+                        )}
+                        {loading ? "Drafting…" : "Create Draft"}
+                      </button>
+                    )}
+                  </div>
                 </div>
               </section>
             ) : (

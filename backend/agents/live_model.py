@@ -2,8 +2,9 @@ import base64
 import json
 from typing import Any, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from backend.schemas import IntakeState
 from backend.settings import Settings
 
 
@@ -25,6 +26,7 @@ class LiveCandidate(BaseModel):
     followup: str
     source: str = "deterministic"
     fallback_reason: str | None = None
+    intake_state: IntakeState = Field(default_factory=IntakeState)
 
 
 class LiveModelAdapter(Protocol):
@@ -47,6 +49,7 @@ class DeterministicLiveModelAdapter:
             confirmation=candidate["confirmation"],
             followup=candidate["followup"],
             source="deterministic",
+            intake_state=intake_state_for_observation(observation),
         )
 
 
@@ -76,7 +79,12 @@ class GeminiVertexLiveModelAdapter:
         prompt = build_candidate_prompt(observation)
         try:
             response_text = await self._generate_text_response(prompt, observation)
-            return candidate_from_model_text(response_text, source="vertex-gemini-text")
+            candidate = candidate_from_model_text(
+                response_text, source="vertex-gemini-text"
+            )
+            return candidate.model_copy(
+                update={"intake_state": intake_state_for_observation(observation)}
+            )
         except Exception as exc:
             fallback = await self._deterministic_fallback.detect_candidate(observation)
             return fallback.model_copy(
@@ -177,6 +185,24 @@ def build_candidate_prompt(observation: LiveObservation) -> str:
     )
 
 
+def intake_state_for_observation(observation: LiveObservation) -> IntakeState:
+    has_frame = bool(observation.image_frame)
+    has_summary = bool((observation.image_summary or "").strip())
+    if has_frame:
+        provenance = "camera_observed"
+        frame_status = "available"
+    elif has_summary:
+        provenance = "visual_unclear"
+        frame_status = "available"
+    else:
+        provenance = "resident_reported_only"
+        frame_status = "not_available"
+    return IntakeState(
+        frame_status=frame_status,
+        candidate_provenance=provenance,
+    )
+
+
 def image_bytes_from_data_url(value: str | None) -> bytes | None:
     if not value:
         return None
@@ -265,6 +291,10 @@ def _path_from_text(value: str) -> tuple[str, str]:
 
 def infer_live_report_path(transcript: str) -> tuple[str, str]:
     normalized = transcript.lower()
+    has_flooding_signal = any(
+        word in normalized
+        for word in ["flood", "water", "standing water", "drain", "catch basin", "sewer"]
+    )
     if any(
         word in normalized
         for word in ["trash", "garbage", "refuse", "rubbish", "bags", "bagged", "dumping"]
@@ -272,8 +302,24 @@ def infer_live_report_path(transcript: str) -> tuple[str, str]:
         return "trash_bags_on_street", "street_trash_bags"
     if any(word in normalized for word in ["drain", "catch basin", "sewer", "clogged"]):
         return "flooding_near_school_crossing", "visible_drain_obstruction"
-    if any(word in normalized for word in ["crosswalk", "blocked", "blocking", "traffic lane"]):
+    if has_flooding_signal and any(
+        word in normalized for word in ["crosswalk", "blocked", "blocking", "traffic lane"]
+    ):
         return "flooding_near_school_crossing", "blocked_crosswalk"
+    if any(
+        phrase in normalized
+        for phrase in [
+            "sidewalk obstruction",
+            "blocking the sidewalk",
+            "blocked sidewalk",
+            "partially blocking the sidewalk",
+            "wheelchair users",
+            "strollers",
+            "pedestrians need to walk around",
+            "pedestrians would need to walk around",
+        ]
+    ):
+        return "trash_bags_on_street", "street_trash_bags"
     return "flooding_near_school_crossing", "baseline"
 
 

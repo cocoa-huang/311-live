@@ -44,6 +44,17 @@ export interface CivicContext {
   fallback_reason: string | null;
 }
 
+export interface IntakeState {
+  frame_status: "not_available" | "available" | "not_required";
+  candidate_provenance:
+    | "camera_observed"
+    | "resident_reported_only"
+    | "visual_unclear";
+  resident_confirmed_intent: boolean;
+  location_confirmed: boolean;
+  draft_ready: boolean;
+}
+
 export interface CollectedInput {
   kind: "text" | "audio" | "image" | "location";
   value: string;
@@ -132,6 +143,7 @@ export interface LiveClassifyResponse {
   followup: string;
   model_source: string;
   fallback_reason: string | null;
+  intake_state: IntakeState;
 }
 
 const API_BASE_URL =
