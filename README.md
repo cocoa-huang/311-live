@@ -4,9 +4,10 @@
 street condition through their phone camera, talk with a live intake agent, and
 review a structured 311-style report draft before confirming it.
 
-Hosted demo:
+## Live Demo
 
-https://live311-frontend-916762998168.us-central1.run.app
+- Citizen reporting app: [311 Live Demo](https://live311-frontend-916762998168.us-central1.run.app)
+- Backend service: [Cloud Run API](https://live311-backend-916762998168.us-central1.run.app)
 
 The hosted Gemini Live path is protected by an access code. Ask the project
 owner for the current demo code before testing live voice/video intake.
