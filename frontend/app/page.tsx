@@ -172,6 +172,8 @@ const demoGeolockLocation = {
   source: "demo geolock",
 };
 
+const realLocationMode = process.env.NEXT_PUBLIC_REAL_LOCATION_MODE === "true";
+
 export default function CitizenApp() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -188,6 +190,7 @@ export default function CitizenApp() {
   const subtitleQueueRef = useRef<string[]>([]);
   const subtitleTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const modelTurnActiveRef = useRef(false);
+  const currentLocationRef = useRef<GeolocationCoordinates | null>(null);
   const [mounted, setMounted] = useState(false);
   const [phase, setPhase] = useState<Phase>("ready");
   const [draft, setDraft] = useState<ReportDraft | null>(null);
@@ -210,6 +213,7 @@ export default function CitizenApp() {
   const [confirming, setConfirming] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmationNotice, setConfirmationNotice] = useState<string | null>(null);
   const [userSpeaking, setUserSpeaking] = useState<string>("");
   const [cameraFramesSent, setCameraFramesSent] = useState(0);
   const [intakeState, setIntakeState] = useState<IntakeState | null>(null);
@@ -262,6 +266,7 @@ export default function CitizenApp() {
     setUserSpeaking("");
     setCameraFramesSent(0);
     setIntakeState(null);
+    currentLocationRef.current = null;
   }, []);
 
   function scheduleDraftTransition(report: ReportDraft, nextIntakeState?: IntakeState) {
@@ -280,7 +285,7 @@ export default function CitizenApp() {
     setLoading(false);
     setLiveAgentMessage(
       remainingPlaybackSeconds > 0.1
-        ? "Finishing Gemini's spoken summary before opening the report."
+        ? "Finishing the agent's summary before opening the report."
         : null,
     );
 
@@ -337,42 +342,47 @@ export default function CitizenApp() {
   }
 
   function currentLocationPayload(confirmed = false) {
+    const location = currentLocationRef.current ?? currentLocation;
+    if (location && (!geminiLiveMode || realLocationMode)) {
+      return {
+        label: null,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        accuracy_meters: location.accuracy,
+        street_address: null,
+        intersection: null,
+        neighborhood: null,
+        borough: null,
+        source: "browser geolocation",
+        confirmed,
+      };
+    }
+    if (geminiLiveMode && realLocationMode) {
+      return undefined;
+    }
     if (geminiLiveMode) {
       return {
         ...demoGeolockLocation,
         confirmed,
       };
     }
-    return currentLocation
-      ? {
-          label: null,
-          latitude: currentLocation.latitude,
-          longitude: currentLocation.longitude,
-          accuracy_meters: currentLocation.accuracy,
-          street_address: null,
-          intersection: null,
-          neighborhood: null,
-          borough: null,
-          source: "browser geolocation",
-          confirmed,
-        }
-      : undefined;
+    return undefined;
   }
 
   function locationLabel() {
     if (currentLocation) {
-      return "Phone location captured";
+      return realLocationMode ? "Phone location shared" : "Phone location captured";
     }
     if (locationStatus === "requesting") {
-      return "Requesting";
+      return "Requesting location";
     }
     if (locationStatus === "active") {
       return "Available";
     }
     if (locationStatus === "denied") {
-      return "Needs permission";
+      return "Permission needed";
     }
-    return "Needs confirmation";
+    return "Enter location manually";
   }
 
   function inferIssueVariant(description: string) {
@@ -396,6 +406,7 @@ export default function CitizenApp() {
   function startReport() {
     setDraft(null);
     setError(null);
+    currentLocationRef.current = null;
     setCurrentLocation(null);
     setLocationStatus("idle");
     setIssueDescription("");
@@ -749,6 +760,7 @@ export default function CitizenApp() {
     await new Promise<void>((resolve) => {
       navigator.geolocation.getCurrentPosition(
         (position) => {
+          currentLocationRef.current = position.coords;
           setCurrentLocation(position.coords);
           setLocationStatus("active");
           resolve();
@@ -1010,6 +1022,9 @@ export default function CitizenApp() {
     try {
       const response = await confirmDraft(draft.id);
       setDraft(response.report);
+      setConfirmationNotice(
+        `${response.message} Ticket updates will appear here when live submission is connected.`,
+      );
       setPhase("confirmed");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not confirm report.");
@@ -1045,6 +1060,7 @@ export default function CitizenApp() {
     setIssueDescription("");
     setDetectedVariant(null);
     setInterimTranscript("");
+    setConfirmationNotice(null);
     setLiveAgentMessage(null);
     setCandidateFollowup(null);
     setLiveAgentStatus("offline");
@@ -1376,7 +1392,11 @@ export default function CitizenApp() {
 
                       {/* HUD bottom — DTPR chips */}
                       <div className="flex flex-wrap gap-1.5">
-                        {(["Camera", "Mic", "Demo geolock"] as const).map((chip) => (
+                        {[
+                          "Camera",
+                          "Mic",
+                          realLocationMode ? "Phone location" : "Demo location",
+                        ].map((chip) => (
                           <span
                             key={chip}
                             className="bg-white/10 px-2 py-1 text-[10px] font-bold text-white/75 backdrop-blur-sm"
@@ -1492,8 +1512,8 @@ export default function CitizenApp() {
                             (liveAgentMessage ||
                               (geminiLiveMode
                                 ? cameraFramesSent > 0
-                                  ? "Session ready. I have demo location and camera context. Say what you want to report when you are ready."
-                                  : "Session ready. I have demo location; waiting for camera frames."
+                                  ? "Session ready. I have location and camera context. Say what you want to report when you are ready."
+                                  : "Session ready. I have location context; waiting for camera frames."
                                 : "Tell me what you are seeing, then I will identify the likely 311 issue."))}
                           {phase === "candidate" &&
                             (liveAgentMessage || activeVariant.confirmation)}
@@ -1680,6 +1700,32 @@ export default function CitizenApp() {
               </section>
             ) : (
               <>
+                {phase === "confirmed" && confirmationNotice && (
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    className="border border-signal/25 bg-signal/8 px-4 py-4 shadow-card"
+                  >
+                    <div className="flex items-start gap-3">
+                      <div className="flex h-9 w-9 shrink-0 items-center justify-center bg-signal text-white">
+                        <CheckCircle2 size={18} aria-hidden="true" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-black text-ink">Report confirmed</p>
+                        <p className="mt-1 text-sm leading-6 text-ink/65">
+                          {confirmationNotice}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmationNotice(null)}
+                        className="focus-ring shrink-0 border border-ink/15 bg-white px-3 py-1.5 text-xs font-black text-ink/60 hover:bg-field"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {draft && (
                   <>
                     <ReportReview

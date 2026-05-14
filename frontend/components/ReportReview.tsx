@@ -28,13 +28,6 @@ function locationDetail(report: ReportDraft) {
   return Array.from(new Set(details)).join(" · ");
 }
 
-const priorityStyle: Record<string, string> = {
-  high: "bg-red-100 text-red-700",
-  medium: "bg-brand text-ink",
-  low: "bg-signal/12 text-signal",
-  unknown: "bg-field text-ink/50",
-};
-
 export function ReportReview({
   report,
   onConfirm,
@@ -56,9 +49,6 @@ export function ReportReview({
   );
   const actionableReview = report.human_review.filter(
     (item) => item.field === "location.confirmed",
-  );
-  const schoolTransitReview = report.human_review.find(
-    (item) => item.field === "priority.school_transit_escalation",
   );
 
   useEffect(() => {
@@ -93,8 +83,8 @@ export function ReportReview({
     <section className="space-y-4" aria-labelledby="draft-heading">
       <div className="bg-white shadow-card">
         {/* Card header */}
-        <div className="flex flex-wrap items-start justify-between gap-3 border-l-[3px] border-brand px-5 py-4">
-          <div>
+        <div className="border-l-[3px] border-brand px-5 py-4">
+          <div className="min-w-0">
             <p className="text-[9px] font-black uppercase tracking-[0.2em] text-ink/35">
               Review your report
             </p>
@@ -102,34 +92,12 @@ export function ReportReview({
               {report.title}
             </h2>
           </div>
-          <span
-            className={`px-3 py-1 text-sm font-black capitalize ${
-              priorityStyle[report.priority] ?? priorityStyle.unknown
-            }`}
-          >
-            {report.priority}
-          </span>
         </div>
 
         <div className="border-t border-ink/8 px-5 py-4">
           <p className="text-sm font-semibold text-ink/55">
-            Check this before sending it to 311.
+            Check this before confirming the demo report. Phone location can be approximate.
           </p>
-
-          {/* School/transit escalation notice */}
-          {schoolTransitReview && (
-            <div className="mt-4 border border-red-200 bg-red-50 p-3">
-              <div className="flex items-center gap-2">
-                <HelpCircle size={16} className="text-red-600" />
-                <p className="text-sm font-black text-red-800">
-                  High priority — school or transit access
-                </p>
-              </div>
-              <p className="mt-1.5 text-sm leading-6 text-red-700">
-                {schoolTransitReview.current_value}
-              </p>
-            </div>
-          )}
 
           {/* Editable fields */}
           <div className="mt-4 grid grid-cols-1 gap-3">
@@ -181,7 +149,7 @@ export function ReportReview({
                       disabled={confirmed}
                       className="h-4 w-4 border-ink/20 accent-brand"
                     />
-                    Resident confirmed exact location
+                    This is the correct report location
                   </label>
                   {(detail || report.location.accuracy_meters || report.location.source) && (
                     <dl className="mt-3 grid grid-cols-1 gap-2 text-xs text-ink/50 sm:grid-cols-2">
@@ -231,7 +199,7 @@ export function ReportReview({
             <div className="mt-4 border border-caution/25 bg-caution/8 p-3">
               <div className="flex items-center gap-2">
                 <HelpCircle size={16} className="text-caution" />
-                <p className="text-sm font-black text-ink">Please check before sending</p>
+                <p className="text-sm font-black text-ink">Please check before confirming</p>
               </div>
               <ul className="mt-2 space-y-1">
                 {actionableReview.map((item) => (

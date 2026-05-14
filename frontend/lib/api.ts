@@ -114,7 +114,6 @@ export interface ReportDraft {
   narrative: string;
   location: Location;
   observed_at: string | null;
-  priority: "low" | "medium" | "high" | "unknown";
   routing: RoutingTarget | null;
   civic_context: CivicContext | null;
   collected_inputs: CollectedInput[];
@@ -131,7 +130,6 @@ export interface ReportUpdateRequest {
   description?: string;
   category?: string;
   subcategory?: string | null;
-  priority?: ReportDraft["priority"];
   location?: Location;
 }
 

@@ -1,13 +1,18 @@
 from fastapi.testclient import TestClient
 
 from backend.agents.live_model import LiveCandidate, LiveObservation
+from backend.agents.report_builder import build_report_draft
 from backend.main import (
     _decode_jpeg_frame,
+    _location_log_payload,
+    _looks_like_complete_location_correction,
     _looks_like_corrupted_transcript,
+    _looks_like_explicit_location_confirmation,
     create_app,
 )
-from backend.schemas import CivicContext, IntakeState, ReportDraftRequest
+from backend.schemas import CivicContext, IntakeState, Location, ReportDraftRequest
 from backend.settings import get_settings
+from backend.tools.location_labeler import ReverseGeocodeResult
 from backend.tools.nyc_311_context import ContextProviderError
 
 
@@ -30,6 +35,25 @@ class StubContextProvider:
 class FailingContextProvider:
     def context_for_report(self, request: ReportDraftRequest) -> CivicContext:
         raise ContextProviderError("timeout")
+
+
+class StubReverseGeocoder:
+    def __init__(self) -> None:
+        self.calls: list[tuple[float, float]] = []
+
+    def reverse_geocode(
+        self,
+        latitude: float,
+        longitude: float,
+    ) -> ReverseGeocodeResult:
+        self.calls.append((latitude, longitude))
+        return ReverseGeocodeResult(
+            label="Near E 8th St and Avenue A, East Village, Manhattan",
+            intersection="E 8th St and Avenue A",
+            neighborhood="East Village",
+            borough="Manhattan",
+            source="reverse_geocoder:test",
+        )
 
 
 class StubLiveModelAdapter:
@@ -79,6 +103,47 @@ def test_corrupted_transcript_detector_flags_symbolic_gibberish() -> None:
 
 def test_corrupted_transcript_detector_accepts_short_valid_confirmation() -> None:
     assert _looks_like_corrupted_transcript("Yes, that's correct.") is False
+
+
+def test_location_correction_validator_rejects_fragments() -> None:
+    assert _looks_like_complete_location_correction("Ave A and East") is False
+    assert _looks_like_complete_location_correction("it street") is False
+
+
+def test_location_correction_validator_accepts_complete_places() -> None:
+    assert _looks_like_complete_location_correction("Ave D and East 3rd Street") is True
+    assert _looks_like_complete_location_correction("8 East 8th Street") is True
+
+
+def test_location_confirmation_evidence_requires_explicit_confirmation() -> None:
+    assert _looks_like_explicit_location_confirmation("resident said yes") is True
+    assert (
+        _looks_like_explicit_location_confirmation(
+            "resident confirmed after repeat-back"
+        )
+        is True
+    )
+    assert _looks_like_explicit_location_confirmation("resident corrected location") is False
+
+
+def test_location_log_payload_includes_geocoder_fields() -> None:
+    payload = _location_log_payload(
+        Location(
+            label="Ave D and East 3rd Street",
+            latitude=40.721,
+            longitude=-73.978,
+            accuracy_meters=18,
+            intersection="Ave D and East 3rd Street",
+            neighborhood="East Village",
+            borough="Manhattan",
+            source="browser geolocation + reverse_geocoder:test",
+            confirmed=False,
+        )
+    )
+
+    assert payload["present"] is True
+    assert payload["intersection"] == "Ave D and East 3rd Street"
+    assert payload["source"] == "browser geolocation + reverse_geocoder:test"
 
 
 def test_demo_draft_report_returns_story_routing_and_dtpr_chain() -> None:
@@ -206,7 +271,6 @@ def test_demo_draft_supports_street_trash_bags_scenario() -> None:
     payload = response.json()
     assert payload["category"] == "street_cleanliness"
     assert payload["subcategory"] == "trash_bags_on_street"
-    assert payload["priority"] == "medium"
     assert payload["routing"]["agency"] == "NYC DSNY"
     assert "trash" in payload["title"].lower()
     assert "sanitation" in payload["uncertainty"][1]["reason"].lower()
@@ -313,6 +377,36 @@ def test_demo_draft_labels_unlabeled_phone_coordinates() -> None:
     )
     assert payload["location"]["accuracy_meters"] == 18
     assert payload["location"]["source"] == "deterministic demo geocoder"
+
+
+def test_report_builder_can_use_reverse_geocoder_for_phone_coordinates() -> None:
+    geocoder = StubReverseGeocoder()
+
+    draft = build_report_draft(
+        ReportDraftRequest(
+            scenario="trash_bags_on_street",
+            location=Location(
+                label="Current phone location",
+                latitude=40.7271,
+                longitude=-73.9837,
+                accuracy_meters=12,
+                source="browser geolocation",
+                confirmed=False,
+            ),
+        ),
+        reverse_geocoder=geocoder,
+    )
+
+    assert geocoder.calls == [(40.7271, -73.9837)]
+    assert draft.location.label == "Near E 8th St and Avenue A, East Village, Manhattan"
+    assert draft.location.latitude == 40.7271
+    assert draft.location.longitude == -73.9837
+    assert draft.location.accuracy_meters == 12
+    assert draft.location.intersection == "E 8th St and Avenue A"
+    assert draft.location.neighborhood == "East Village"
+    assert draft.location.borough == "Manhattan"
+    assert draft.location.source == "browser geolocation + reverse_geocoder:test"
+    assert draft.location.confirmed is False
 
 
 def test_confirm_report_marks_existing_draft_confirmed() -> None:

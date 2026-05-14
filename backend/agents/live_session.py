@@ -11,6 +11,7 @@ from backend.agents.live_model import (
 )
 from backend.agents.report_builder import build_report_draft
 from backend.schemas import IntakeState, Location, ReportDraft, ReportDraftRequest
+from backend.tools.location_labeler import ReverseGeocoder
 from backend.tools.nyc_311_context import CivicContextProvider
 
 
@@ -49,10 +50,12 @@ class LiveSession:
         self,
         context_provider: CivicContextProvider | None = None,
         model_adapter: LiveModelAdapter | None = None,
+        reverse_geocoder: ReverseGeocoder | None = None,
     ) -> None:
         self.session_id = f"live_{uuid4().hex[:10]}"
         self.context_provider = context_provider
         self.model_adapter = model_adapter or DeterministicLiveModelAdapter()
+        self.reverse_geocoder = reverse_geocoder
         self.transcript: str | None = None
         self.image_summary: str | None = None
         self.location: Location | None = None
@@ -197,7 +200,11 @@ class LiveSession:
             location=self.location,
             candidate_provenance=self.intake_state.candidate_provenance,
         )
-        draft = build_report_draft(request, self.context_provider)
+        draft = build_report_draft(
+            request,
+            self.context_provider,
+            self.reverse_geocoder,
+        )
         self.intake_state = self.intake_state.model_copy(update={"draft_ready": True})
         return self._draft_event(draft)
 

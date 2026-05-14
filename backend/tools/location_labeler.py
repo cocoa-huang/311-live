@@ -1,7 +1,14 @@
 from dataclasses import dataclass
+import logging
 from math import atan2, cos, radians, sin, sqrt
+from typing import Protocol
+
+import httpx
 
 from backend.schemas import Location
+from backend.settings import Settings
+
+logger = logging.getLogger("uvicorn.error")
 
 
 GENERIC_LOCATION_LABELS = {
@@ -10,6 +17,14 @@ GENERIC_LOCATION_LABELS = {
     "Current phone location",
     "Location provided without a label",
     "Approximate location",
+}
+
+NYC_COUNTY_TO_BOROUGH = {
+    "New York County": "Manhattan",
+    "Kings County": "Brooklyn",
+    "Queens County": "Queens",
+    "Bronx County": "Bronx",
+    "Richmond County": "Staten Island",
 }
 
 
@@ -23,6 +38,75 @@ class KnownPlace:
     neighborhood: str
     borough: str
     radius_meters: float
+
+
+@dataclass(frozen=True)
+class ReverseGeocodeResult:
+    label: str | None = None
+    street_address: str | None = None
+    intersection: str | None = None
+    neighborhood: str | None = None
+    borough: str | None = None
+    source: str = "reverse geocoder"
+
+
+class ReverseGeocoder(Protocol):
+    def reverse_geocode(
+        self,
+        latitude: float,
+        longitude: float,
+    ) -> ReverseGeocodeResult | None:
+        ...
+
+
+class MapboxReverseGeocoder:
+    def __init__(self, access_token: str, timeout_seconds: float = 1.5) -> None:
+        self._access_token = access_token
+        self._timeout_seconds = timeout_seconds
+        self._cache: dict[tuple[float, float], ReverseGeocodeResult | None] = {}
+
+    def reverse_geocode(
+        self,
+        latitude: float,
+        longitude: float,
+    ) -> ReverseGeocodeResult | None:
+        cache_key = (round(latitude, 5), round(longitude, 5))
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        try:
+            response = httpx.get(
+                "https://api.mapbox.com/search/geocode/v6/reverse",
+                params={
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "access_token": self._access_token,
+                    "country": "US",
+                    "limit": 1,
+                },
+                timeout=self._timeout_seconds,
+            )
+            response.raise_for_status()
+            result = _parse_mapbox_reverse_response(response.json())
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("mapbox reverse geocode failed: %s", type(exc).__name__)
+            result = None
+
+        if result:
+            self._cache[cache_key] = result
+        return result
+
+
+def reverse_geocoder_from_settings(settings: Settings) -> ReverseGeocoder | None:
+    mode = settings.location_label_mode.lower().strip()
+    if mode in {"deterministic", "fallback", "off", ""}:
+        return None
+    if mode == "mapbox" and settings.mapbox_access_token:
+        return MapboxReverseGeocoder(
+            settings.mapbox_access_token,
+            settings.reverse_geocode_timeout_seconds,
+        )
+    return None
 
 
 KNOWN_PLACES = (
@@ -49,9 +133,20 @@ KNOWN_PLACES = (
 )
 
 
-def label_location(location: Location) -> Location:
+def label_location(
+    location: Location,
+    reverse_geocoder: ReverseGeocoder | None = None,
+) -> Location:
     if location.latitude is None or location.longitude is None:
         return location
+
+    if _has_reverse_geocode_source(location) and location.label not in GENERIC_LOCATION_LABELS:
+        return location
+
+    if reverse_geocoder:
+        geocoded = reverse_geocoder.reverse_geocode(location.latitude, location.longitude)
+        if geocoded:
+            return _apply_reverse_geocode(location, geocoded)
 
     known_place = _nearest_known_place(location)
     if known_place:
@@ -69,6 +164,38 @@ def label_location(location: Location) -> Location:
             "source": location.source or "gps coordinate fallback",
         }
     )
+
+
+def _apply_reverse_geocode(
+    location: Location,
+    result: ReverseGeocodeResult,
+) -> Location:
+    label = location.label
+    if label in GENERIC_LOCATION_LABELS:
+        label = result.label or _fallback_coordinate_label(
+            location,
+            result.borough
+            or _borough_for_coordinates(location.latitude, location.longitude),
+        )
+
+    source = result.source
+    if location.source:
+        source = f"{location.source} + {result.source}"
+
+    return location.model_copy(
+        update={
+            "label": label,
+            "street_address": location.street_address or result.street_address,
+            "intersection": location.intersection or result.intersection,
+            "neighborhood": location.neighborhood or result.neighborhood,
+            "borough": location.borough or result.borough,
+            "source": source,
+        }
+    )
+
+
+def _has_reverse_geocode_source(location: Location) -> bool:
+    return bool(location.source and "reverse_geocoder:" in location.source)
 
 
 def _apply_known_place(location: Location, place: KnownPlace) -> Location:
@@ -102,6 +229,56 @@ def _nearest_known_place(location: Location) -> KnownPlace | None:
         ):
             nearest = (distance, place)
     return nearest[1] if nearest else None
+
+
+def _parse_mapbox_reverse_response(payload: dict) -> ReverseGeocodeResult | None:
+    features = payload.get("features")
+    if not isinstance(features, list) or not features:
+        return None
+
+    feature = features[0]
+    if not isinstance(feature, dict):
+        return None
+
+    properties = feature.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    context = properties.get("context")
+    if not isinstance(context, dict):
+        context = {}
+
+    full_address = _string_or_none(properties.get("full_address"))
+    name = _string_or_none(properties.get("name"))
+    label = full_address or name
+
+    neighborhood = _mapbox_context_name(context.get("neighborhood"))
+    borough = _mapbox_context_name(context.get("district")) or _mapbox_context_name(
+        context.get("place")
+    )
+    if borough in NYC_COUNTY_TO_BOROUGH:
+        borough = NYC_COUNTY_TO_BOROUGH[borough]
+    if borough == "New York":
+        borough = None
+
+    return ReverseGeocodeResult(
+        label=label,
+        street_address=full_address if full_address != name else None,
+        neighborhood=neighborhood,
+        borough=borough,
+        source="reverse_geocoder:mapbox",
+    )
+
+
+def _mapbox_context_name(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    return _string_or_none(value.get("name"))
+
+
+def _string_or_none(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _distance_meters(

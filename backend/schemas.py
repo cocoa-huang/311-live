@@ -16,13 +16,6 @@ class ReportStatus(str, Enum):
     CONFIRMED = "confirmed"
 
 
-class Priority(str, Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    UNKNOWN = "unknown"
-
-
 class DataOrigin(str, Enum):
     COLLECTED = "collected"
     INFERRED = "inferred"
@@ -196,7 +189,6 @@ class ReportUpdateRequest(BaseModel):
     description: Optional[str] = Field(default=None, min_length=1)
     category: Optional[str] = Field(default=None, min_length=1)
     subcategory: Optional[str] = None
-    priority: Optional[Priority] = None
     location: Optional[Location] = None
 
 
@@ -210,7 +202,6 @@ class ReportDraft(BaseModel):
     narrative: str
     location: Location
     observed_at: Optional[datetime] = None
-    priority: Priority = Priority.UNKNOWN
     routing: Optional[RoutingTarget] = None
     civic_context: Optional[CivicContext] = None
     collected_inputs: List[CollectedInput] = Field(default_factory=list)

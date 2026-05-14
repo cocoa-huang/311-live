@@ -8,13 +8,12 @@ from backend.schemas import (
     HumanReviewField,
     InferredContext,
     Location,
-    Priority,
     ReportDraft,
     ReportDraftRequest,
     UncertaintyItem,
 )
 from backend.tools.dtpr import build_demo_dtpr_chain
-from backend.tools.location_labeler import label_location
+from backend.tools.location_labeler import ReverseGeocoder, label_location
 from backend.tools.nyc_311_context import (
     CivicContextProvider,
     ContextProviderError,
@@ -116,7 +115,6 @@ DEMO_VARIANTS = {
         "subcategory": "trash_bags_on_street",
         "title": "Trash bags obstructing the street or sidewalk",
         "service_context": "Street trash or sanitation obstruction",
-        "priority": Priority.MEDIUM,
         "transcript": (
             "There are trash bags piled on the street near my location. People have "
             "to walk around them and some loose garbage is spreading."
@@ -228,6 +226,7 @@ def _draft_visible_text(
 def build_report_draft(
     request: ReportDraftRequest,
     context_provider: CivicContextProvider | None = None,
+    reverse_geocoder: ReverseGeocoder | None = None,
 ) -> ReportDraft:
     if request.scenario and request.scenario not in DEFAULT_VARIANT_BY_SCENARIO:
         raise ValueError("Unsupported scenario")
@@ -250,17 +249,13 @@ def build_report_draft(
     service_context = str(
         variant.get("service_context", "Street flooding near a school crossing")
     )
-    priority = variant.get("priority", Priority.HIGH)
-    # Escalate to HIGH when issue is near school/transit and impacts a specific group.
-    if request.near_school_or_transit and request.special_population_impact:
-        priority = Priority.HIGH
     transcript = request.transcript or str(variant["transcript"])
     image_summary = (
         request.visual_evidence_summary
         or request.image_summary
         or str(variant["image_summary"])
     )
-    location = label_location(request.location or variant["location"])
+    location = label_location(request.location or variant["location"], reverse_geocoder)
     routing = fallback_route_for_category(category, subcategory)
     provider = context_provider or Fallback311ContextProvider()
     context_request = request.model_copy(update={"scenario": variant_scenario})
@@ -283,7 +278,6 @@ def build_report_draft(
         narrative=narrative,
         location=location,
         observed_at=datetime.now(timezone.utc),
-        priority=priority,
         routing=routing,
         civic_context=civic_context,
         collected_inputs=[
@@ -462,21 +456,6 @@ def build_report_draft(
                 ]
                 if request.candidate_provenance
                 in {"resident_reported_only", "visual_unclear"}
-                else []
-            ),
-            *(
-                [
-                    HumanReviewField(
-                        field="priority.school_transit_escalation",
-                        reason=(
-                            "Priority was escalated to HIGH because the issue is near a "
-                            "school or transit stop and impacts a specific population group. "
-                            "Confirm this is accurate before submission."
-                        ),
-                        current_value=request.special_population_impact,
-                    )
-                ]
-                if request.near_school_or_transit and request.special_population_impact
                 else []
             ),
         ],

@@ -25,6 +25,15 @@ class Settings(BaseModel):
     socrata_timeout_seconds: float = Field(
         default_factory=lambda: float(getenv("SOCRATA_TIMEOUT_SECONDS", "2.0"))
     )
+    location_label_mode: str = Field(
+        default_factory=lambda: getenv("LOCATION_LABEL_MODE", "deterministic")
+    )
+    mapbox_access_token: str | None = Field(
+        default_factory=lambda: getenv("MAPBOX_ACCESS_TOKEN") or None
+    )
+    reverse_geocode_timeout_seconds: float = Field(
+        default_factory=lambda: float(getenv("REVERSE_GEOCODE_TIMEOUT_SECONDS", "1.5"))
+    )
     live_model_mode: str = Field(
         default_factory=lambda: getenv("LIVE_MODEL_MODE", "deterministic")
     )

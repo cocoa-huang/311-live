@@ -30,6 +30,7 @@ from backend.schemas import (
     IntakeState,
     LiveClassifyRequest,
     LiveClassifyResponse,
+    Location,
     ModelContextPacket,
     ReportConfirmRequest,
     ReportConfirmResponse,
@@ -38,12 +39,19 @@ from backend.schemas import (
     ReportUpdateRequest,
 )
 from backend.settings import get_settings
+from backend.tools.location_labeler import label_location, reverse_geocoder_from_settings
 from backend.tools.nyc_311_context import CivicContextProvider, provider_from_settings
 from backend.tools.report_store import report_store
 
 logger = logging.getLogger("uvicorn.error")
 MAX_IMAGE_FRAME_BYTES = 2_000_000
 LIVE_ACCESS_HEADER = "x-live-access-code"
+ACCEPTED_LOCATION_STATUSES = {"geolock_accepted", "correction_confirmed"}
+UNCONFIRMED_LOCATION_STATUSES = {
+    "resident_corrected",
+    "correction_pending_confirmation",
+    "unconfirmed",
+}
 
 
 def _looks_like_corrupted_transcript(value: str) -> bool:
@@ -82,12 +90,120 @@ def _live_access_allowed(settings, provided_code: str | None) -> bool:
     return compare_digest(provided_code, settings.live_access_code)
 
 
+def _location_from_payload(value: object) -> Location | None:
+    if not isinstance(value, dict):
+        return None
+    return Location.model_validate(value)
+
+
+def _location_prompt_label(location: Location) -> str:
+    coordinate_label = ""
+    if location.latitude is not None and location.longitude is not None:
+        coordinate_label = (
+            f"{abs(location.latitude):.4f}°{'N' if location.latitude >= 0 else 'S'}, "
+            f"{abs(location.longitude):.4f}°{'E' if location.longitude >= 0 else 'W'}"
+        )
+    parts = [
+        location.label,
+        f"GPS {coordinate_label}" if coordinate_label else None,
+        f"accuracy about {round(location.accuracy_meters)}m"
+        if location.accuracy_meters
+        else None,
+        location.source,
+    ]
+    return "; ".join(part for part in parts if part)
+
+
+def _location_log_payload(location: Location | None) -> dict[str, object | None]:
+    if location is None:
+        return {"present": False}
+    return {
+        "present": True,
+        "label": location.label,
+        "latitude": location.latitude,
+        "longitude": location.longitude,
+        "accuracy_meters": location.accuracy_meters,
+        "street_address": location.street_address,
+        "intersection": location.intersection,
+        "neighborhood": location.neighborhood,
+        "borough": location.borough,
+        "source": location.source,
+        "confirmed": location.confirmed,
+    }
+
+
+def _looks_like_complete_location_correction(value: str | None) -> bool:
+    text = " ".join(str(value or "").strip().split())
+    if len(text) < 8:
+        return False
+
+    normalized = text.lower().strip(" .")
+    incomplete_endings = (
+        " and east",
+        " and west",
+        " and north",
+        " and south",
+        " and e",
+        " and w",
+        " and n",
+        " and s",
+        " ave",
+        " avenue",
+    )
+    if normalized.endswith(incomplete_endings):
+        return False
+
+    has_street_word = any(
+        token in normalized
+        for token in [
+            " st",
+            " street",
+            " ave",
+            " avenue",
+            " road",
+            " rd",
+            " place",
+            " pl",
+            " boulevard",
+            " blvd",
+            " drive",
+            " dr",
+        ]
+    )
+    has_intersection = " and " in normalized or " & " in normalized or " at " in normalized
+    has_address_number = any(char.isdigit() for char in normalized)
+    return has_street_word and (has_intersection or has_address_number)
+
+
+def _looks_like_explicit_location_confirmation(value: str | None) -> bool:
+    text = str(value or "").strip().lower()
+    if len(text) < 3:
+        return False
+    words = {
+        part.strip(".,!?;:")
+        for part in text.replace("'", " ").replace("-", " ").split()
+    }
+    if words.intersection({"yes", "confirmed", "confirm"}):
+        return True
+    confirmation_phrases = [
+        " correct ",
+        " that's right",
+        " that is right",
+        " right location",
+        " exact location",
+        " resident confirmed",
+    ]
+    padded = f" {text} "
+    return any(token in padded for token in confirmation_phrases)
+
+
 def create_app(
     context_provider: CivicContextProvider | None = None,
     live_model_adapter: LiveModelAdapter | None = None,
 ) -> FastAPI:
     settings = get_settings()
     resolved_context_provider = context_provider or provider_from_settings(settings)
+    reverse_geocoder = reverse_geocoder_from_settings(settings)
     resolved_live_model_adapter = live_model_adapter or live_model_adapter_from_settings(
         settings
     )
@@ -114,7 +230,11 @@ def create_app(
     @app.post("/api/report/draft", response_model=ReportDraft)
     def draft_report(request: ReportDraftRequest) -> ReportDraft:
         try:
-            draft = build_report_draft(request, resolved_context_provider)
+            draft = build_report_draft(
+                request,
+                resolved_context_provider,
+                reverse_geocoder,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return report_store.save(draft)
@@ -182,11 +302,17 @@ def create_app(
         await websocket.accept()
         if settings.live_model_mode in {"vertex", "gemini", "gemini-live"}:
             await _run_gemini_live_session(
-                websocket, settings, resolved_context_provider
+                websocket,
+                settings,
+                resolved_context_provider,
+                reverse_geocoder,
             )
         else:
             await _run_deterministic_session(
-                websocket, resolved_context_provider, resolved_live_model_adapter
+                websocket,
+                resolved_context_provider,
+                resolved_live_model_adapter,
+                reverse_geocoder,
             )
 
     return app
@@ -196,8 +322,9 @@ async def _run_deterministic_session(
     websocket: WebSocket,
     context_provider,
     live_model_adapter,
+    reverse_geocoder,
 ) -> None:
-    session = LiveSession(context_provider, live_model_adapter)
+    session = LiveSession(context_provider, live_model_adapter, reverse_geocoder)
     try:
         while True:
             message = await websocket.receive_json()
@@ -250,6 +377,7 @@ async def _run_gemini_live_session(
     websocket: WebSocket,
     settings,
     context_provider,
+    reverse_geocoder,
 ) -> None:
     from backend.agents.live_model import infer_live_report_path
     from backend.agents.report_builder import build_report_draft
@@ -289,6 +417,7 @@ async def _run_gemini_live_session(
         logger.info("gemini-live: Gemini session context opened")
         ctx: dict = {
             "location_label": None,
+            "location": None,
             "intake_state": IntakeState(camera_lifecycle="camera_streaming"),
         }
         audio_frames = 0
@@ -298,10 +427,6 @@ async def _run_gemini_live_session(
         setup_complete = False
         location_nudge_sent = False
         visual_nudge_sent = False
-        pending_draft_ready: dict | None = None
-        pending_draft_ready_timeout: asyncio.Task[None] | None = None
-        waiting_for_post_tool_summary = False
-        saw_post_tool_model_output = False
         await websocket.send_text(
             json.dumps(
                 {
@@ -319,10 +444,24 @@ async def _run_gemini_live_session(
             nonlocal location_nudge_sent
             if not setup_complete or location_nudge_sent or not ctx.get("location_label"):
                 return
+            backend_location = ctx.get("location")
+            logger.info(
+                "gemini-live: sending backend location candidate to Gemini label=%r payload=%s",
+                ctx["location_label"],
+                json.dumps(
+                    _location_log_payload(
+                        backend_location if isinstance(backend_location, Location) else None
+                    ),
+                    sort_keys=True,
+                ),
+            )
             await manager.send_text(
-                f"[System context: Reporter GPS is approximately {ctx['location_label']}. "
-                "Open the session now by greeting the resident and confirming this location, "
-                "e.g. 'I have you near East 8th Street and Avenue A — is that right?']"
+                "[System context update; do not answer this packet directly. "
+                f"Backend-resolved reporter location candidate: {ctx['location_label']}. "
+                "Store this as the authoritative location candidate for the session. "
+                "When the resident has clearly started a report and location confirmation "
+                "is appropriate, ask them to confirm this exact candidate. Do not invent "
+                "or substitute any other address, borough, neighborhood, or intersection.]"
             )
             location_nudge_sent = True
 
@@ -433,39 +572,44 @@ async def _run_gemini_live_session(
                                 await _send_visual_nudge_if_ready()
                         elif msg_type == "start":
                             loc = (data.get("payload") or {}).get("location") or {}
-                            lat = loc.get("latitude")
-                            lng = loc.get("longitude")
-                            if lat is not None and lng is not None:
-                                ctx["location_label"] = (
-                                    f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}, "
-                                    f"{abs(lng):.4f}°{'E' if lng >= 0 else 'W'}"
+                            location = _location_from_payload(loc)
+                            logger.info(
+                                "gemini-live: start location payload %s",
+                                json.dumps(_location_log_payload(location), sort_keys=True),
+                            )
+                            if (
+                                location
+                                and location.latitude is not None
+                                and location.longitude is not None
+                            ):
+                                geocode_started_at = time.monotonic()
+                                labeled_location = await asyncio.to_thread(
+                                    label_location,
+                                    location,
+                                    reverse_geocoder,
+                                )
+                                logger.info(
+                                    "gemini-live: labeled start location latency=%.3fs payload=%s",
+                                    time.monotonic() - geocode_started_at,
+                                    json.dumps(
+                                        _location_log_payload(labeled_location),
+                                        sort_keys=True,
+                                    ),
+                                )
+                                ctx["location"] = labeled_location
+                                ctx["location_label"] = _location_prompt_label(
+                                    labeled_location
                                 )
                                 await _send_location_nudge_if_ready()
+                            else:
+                                logger.info(
+                                    "gemini-live: no usable start location coordinates"
+                                )
             except (WebSocketDisconnect, RuntimeError):
                 pass
 
         async def _recv_from_gemini() -> None:
-            nonlocal pending_draft_ready, pending_draft_ready_timeout
-            nonlocal setup_complete, waiting_for_post_tool_summary
-            nonlocal saw_post_tool_model_output
-
-            async def _send_pending_draft_ready_after_timeout() -> None:
-                nonlocal pending_draft_ready, pending_draft_ready_timeout
-                nonlocal waiting_for_post_tool_summary, saw_post_tool_model_output
-
-                try:
-                    await asyncio.sleep(6.0)
-                    if not pending_draft_ready:
-                        return
-                    await websocket.send_text(json.dumps(pending_draft_ready))
-                    logger.info(
-                        "gemini-live: draft_ready sent to frontend after post-tool timeout"
-                    )
-                    pending_draft_ready = None
-                    waiting_for_post_tool_summary = False
-                    saw_post_tool_model_output = False
-                finally:
-                    pending_draft_ready_timeout = None
+            nonlocal setup_complete
             try:
                 while True:
                     received_any = False
@@ -476,20 +620,12 @@ async def _run_gemini_live_session(
                             setup_complete = True
                             await _send_location_nudge_if_ready()
                         elif isinstance(event, AudioChunkEvent):
-                            if pending_draft_ready and waiting_for_post_tool_summary:
-                                saw_post_tool_model_output = True
                             logger.info(
                                 "gemini-live: sending audio chunk (%s bytes)",
                                 len(event.data),
                             )
                             await websocket.send_bytes(event.data)
                         elif isinstance(event, TranscriptEvent):
-                            if (
-                                pending_draft_ready
-                                and waiting_for_post_tool_summary
-                                and event.role == "model"
-                            ):
-                                saw_post_tool_model_output = True
                             logger.info(
                                 "gemini-live: transcript role=%s finished=%s text=%r",
                                 event.role,
@@ -546,6 +682,10 @@ async def _run_gemini_live_session(
                                 )
                                 visual_status = args.get("visual_status", "")
                                 readiness_status = args.get("readiness_status", "")
+                                location_status = args.get("location_status", "")
+                                location_confirmation_evidence = args.get(
+                                    "location_confirmation_evidence", ""
+                                )
                                 missing_detail = args.get("missing_required_detail", "")
                                 blocked_path = args.get("blocked_path", "")
                                 passage_status = args.get("passage_status", "")
@@ -563,11 +703,20 @@ async def _run_gemini_live_session(
                                     visual_status,
                                     readiness_status,
                                 )
+                                logger.info(
+                                    "gemini-live: draft tool location args status=%r description=%r confirmation_evidence=%r remaining_uncertainty=%r slot_quality=%r",
+                                    location_status,
+                                    loc_desc,
+                                    location_confirmation_evidence,
+                                    remaining_uncertainty,
+                                    slot_quality,
+                                )
                                 missing_fields = [
                                     field
                                     for field, value in {
                                         "issue_description": issue_desc,
                                         "location_description": loc_desc,
+                                        "location_status": location_status,
                                         "resident_claim_summary": resident_claim,
                                         "visual_evidence_summary": visual_evidence,
                                         "slot_quality_summary": slot_quality,
@@ -606,6 +755,19 @@ async def _run_gemini_live_session(
                                     }.items():
                                         if not str(value or "").strip():
                                             missing_fields.append(field)
+                                if (
+                                    location_status
+                                    and location_status not in ACCEPTED_LOCATION_STATUSES
+                                    and location_status not in UNCONFIRMED_LOCATION_STATUSES
+                                ):
+                                    missing_fields.append("location_status")
+                                if (
+                                    location_status == "geolock_accepted"
+                                    and not _looks_like_explicit_location_confirmation(
+                                        location_confirmation_evidence
+                                    )
+                                ):
+                                    missing_fields.append("location_confirmation_evidence")
                                 if readiness_status == "needs_followup" or missing_fields:
                                     await manager.respond_to_tool_call(
                                         event.call_id,
@@ -625,6 +787,80 @@ async def _run_gemini_live_session(
                                         "gemini-live: rejected premature draft tool call"
                                     )
                                     continue
+                                if location_status in UNCONFIRMED_LOCATION_STATUSES:
+                                    await manager.respond_to_tool_call(
+                                        event.call_id,
+                                        event.name,
+                                        {
+                                            "status": "needs_followup",
+                                            "missing_fields": ["confirmed_report_location"],
+                                            "message": (
+                                                "The resident corrected, rejected, or has "
+                                                "not confirmed the report location. Repeat "
+                                                "the best-heard location back and ask one "
+                                                "explicit confirmation question before "
+                                                "drafting."
+                                            ),
+                                        },
+                                    )
+                                    logger.info(
+                                        "gemini-live: rejected draft because location is not locked status=%r description=%r",
+                                        location_status,
+                                        loc_desc,
+                                    )
+                                    continue
+                                if (
+                                    location_status == "geolock_accepted"
+                                    and not isinstance(ctx.get("location"), Location)
+                                ):
+                                    await manager.respond_to_tool_call(
+                                        event.call_id,
+                                        event.name,
+                                        {
+                                            "status": "needs_followup",
+                                            "missing_fields": ["backend_location_candidate"],
+                                            "message": (
+                                                "No backend location candidate is available. "
+                                                "Ask the resident for a concrete address, "
+                                                "intersection, or place name before drafting."
+                                            ),
+                                        },
+                                    )
+                                    logger.info(
+                                        "gemini-live: rejected geolock acceptance without backend location"
+                                    )
+                                    continue
+                                if location_status == "correction_confirmed":
+                                    if not _looks_like_complete_location_correction(
+                                        loc_desc
+                                    ) or not _looks_like_explicit_location_confirmation(
+                                        location_confirmation_evidence
+                                    ):
+                                        await manager.respond_to_tool_call(
+                                            event.call_id,
+                                            event.name,
+                                            {
+                                                "status": "needs_followup",
+                                                "missing_fields": [
+                                                    "confirmed_corrected_location"
+                                                ],
+                                                "message": (
+                                                    "The corrected location is not complete "
+                                                    "or lacks explicit resident confirmation. "
+                                                    "Repeat the corrected address or "
+                                                    "intersection back and ask whether that "
+                                                    "is the exact report location before "
+                                                    "drafting."
+                                                ),
+                                            },
+                                        )
+                                        logger.info(
+                                            "gemini-live: rejected corrected location status=%r description=%r evidence=%r",
+                                            location_status,
+                                            loc_desc,
+                                            location_confirmation_evidence,
+                                        )
+                                        continue
                                 if visual_status == "supports_claim" and image_frames == 0:
                                     await manager.respond_to_tool_call(
                                         event.call_id,
@@ -677,17 +913,53 @@ async def _run_gemini_live_session(
                                     for part in transcript_parts
                                     if part
                                 )
+                                base_location = ctx.get("location")
+                                if isinstance(base_location, Location):
+                                    resident_corrected = (
+                                        location_status == "correction_confirmed"
+                                        and str(loc_desc or "").strip()
+                                    )
+                                    if resident_corrected:
+                                        draft_location = Location(
+                                            label=str(loc_desc).strip(),
+                                            source=(
+                                                "resident correction during Gemini live intake"
+                                            ),
+                                            confirmed=True,
+                                        )
+                                    else:
+                                        draft_location = base_location.model_copy(
+                                            update={"confirmed": True}
+                                        )
+                                else:
+                                    draft_location = Location(
+                                        label=loc_desc,
+                                        source=(
+                                            "resident correction during Gemini live intake"
+                                            if location_status == "correction_confirmed"
+                                            else "gemini-live-confirmed"
+                                        ),
+                                        confirmed=True,
+                                    )
+                                logger.info(
+                                    "gemini-live: final draft location source=%r status=%r payload=%s",
+                                    "resident_correction"
+                                    if location_status == "correction_confirmed"
+                                    else "backend_candidate",
+                                    location_status,
+                                    json.dumps(
+                                        _location_log_payload(draft_location),
+                                        sort_keys=True,
+                                    ),
+                                )
+
                                 request = ReportDraftRequest(
                                     scenario=scenario,  # type: ignore[arg-type]
                                     demo_variant=demo_variant,  # type: ignore[arg-type]
                                     issue_description=issue_desc or None,
                                     transcript=full_transcript,
                                     image_summary=visual_evidence or None,
-                                    location=Location(
-                                        label=loc_desc,
-                                        source="gemini-live-confirmed",
-                                        confirmed=True,
-                                    ),
+                                    location=draft_location,
                                     resident_claim_summary=resident_claim or None,
                                     visual_evidence_summary=visual_evidence or None,
                                     accessibility_impact=accessibility_impact or None,
@@ -725,7 +997,12 @@ async def _run_gemini_live_session(
                                     remaining_uncertainty=remaining_uncertainty or None,
                                     candidate_provenance=candidate_provenance,
                                 )
-                                draft = build_report_draft(request, context_provider)
+                                draft = await asyncio.to_thread(
+                                    build_report_draft,
+                                    request,
+                                    context_provider,
+                                    reverse_geocoder,
+                                )
                                 report_store.save(draft)
                                 ctx["intake_state"] = ctx["intake_state"].model_copy(
                                     update={
@@ -740,7 +1017,7 @@ async def _run_gemini_live_session(
                                     event.name,
                                     {"status": "success", "report_id": draft.id},
                                 )
-                                pending_draft_ready = {
+                                draft_ready_event = {
                                     "type": "draft_ready",
                                     "payload": {
                                         "report_id": draft.id,
@@ -750,38 +1027,13 @@ async def _run_gemini_live_session(
                                         ].model_dump(mode="json"),
                                     },
                                 }
-                                waiting_for_post_tool_summary = True
-                                saw_post_tool_model_output = False
-                                if pending_draft_ready_timeout:
-                                    pending_draft_ready_timeout.cancel()
-                                pending_draft_ready_timeout = asyncio.create_task(
-                                    _send_pending_draft_ready_after_timeout()
-                                )
+                                await websocket.send_text(json.dumps(draft_ready_event))
                                 logger.info(
-                                    "gemini-live: draft_ready queued until post-tool summary completes"
+                                    "gemini-live: draft_ready sent to frontend immediately after tool success"
                                 )
                         elif isinstance(event, TurnCompleteEvent):
                             logger.info("gemini-live: turn_complete")
                             await websocket.send_text(json.dumps({"type": "turn_complete"}))
-                            if pending_draft_ready:
-                                if (
-                                    waiting_for_post_tool_summary
-                                    and not saw_post_tool_model_output
-                                ):
-                                    logger.info(
-                                        "gemini-live: ignoring pre-summary turn_complete after tool response"
-                                    )
-                                    continue
-                                await websocket.send_text(json.dumps(pending_draft_ready))
-                                logger.info(
-                                    "gemini-live: draft_ready sent to frontend after summary turn_complete"
-                                )
-                                pending_draft_ready = None
-                                waiting_for_post_tool_summary = False
-                                saw_post_tool_model_output = False
-                                if pending_draft_ready_timeout:
-                                    pending_draft_ready_timeout.cancel()
-                                    pending_draft_ready_timeout = None
                     if received_any:
                         logger.info("gemini-live: receive stream ended; waiting for next turn")
                     await asyncio.sleep(0.05)
@@ -798,12 +1050,6 @@ async def _run_gemini_live_session(
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if pending_draft_ready_timeout:
-            pending_draft_ready_timeout.cancel()
-            try:
-                await pending_draft_ready_timeout
             except (asyncio.CancelledError, Exception):
                 pass
     finally:
